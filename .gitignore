@@ -1,2 +1,11 @@
-target/
+/target/
 .devcontainer/
+
+# Local secrets / credentials
+.env
+*.pem
+
+# Runtime-generated artifacts
+/results.jsonl
+/.scan-cache.json
+/disclosures/

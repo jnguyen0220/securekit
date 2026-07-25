@@ -12,4 +12,4 @@ echo "Build complete! Starting the application..."
 echo ""
 
 # Run the application with any arguments passed to this script
-./target/release/secret_repo_scanner "$@"
+./target/release/securekit "$@"

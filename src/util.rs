@@ -1,0 +1,101 @@
+//! Small shared helpers used across the crate: time, hashing, redaction, and
+//! `.env` loading.
+
+use std::fs;
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use sha2::{Digest, Sha256};
+
+/// Seconds since the UNIX epoch (0 if the clock is set before it).
+pub(crate) fn current_unix_time() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// SHA-256 fingerprint of a secret. Storing the fingerprint (instead of the
+/// raw value) lets you prove/track a leak and de-duplicate findings without
+/// hoarding live credentials.
+pub(crate) fn fingerprint_secret(secret: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(secret.as_bytes());
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+/// Redact a secret for display: keep the first/last 4 characters so an owner
+/// can recognise the credential, mask the middle.
+pub(crate) fn redact_secret(secret: &str) -> String {
+    let chars: Vec<char> = secret.chars().collect();
+    let n = chars.len();
+    if n <= 8 {
+        return "*".repeat(n);
+    }
+    let prefix: String = chars[..4].iter().collect();
+    let suffix: String = chars[n - 4..].iter().collect();
+    format!("{}{}{}", prefix, "*".repeat(n - 8), suffix)
+}
+
+/// Build an authenticated HTTPS GitHub URL when a token is available.
+///
+/// Returns `None` for non-GitHub URLs, non-HTTPS URLs, or when no token is
+/// provided.
+pub(crate) fn github_authenticated_url(repo_url: &str, token: Option<&str>) -> Option<String> {
+    match token {
+        Some(t) if repo_url.starts_with("https://github.com/") => Some(
+            repo_url.replacen("https://", &format!("https://x-access-token:{}@", t), 1),
+        ),
+        _ => None,
+    }
+}
+
+/// Remove URL user-info (for example embedded tokens) before logging.
+pub(crate) fn redact_url_credentials(url: &str) -> String {
+    if let Some(rest) = url.strip_prefix("https://") {
+        if let Some((_, host_and_path)) = rest.split_once('@') {
+            return format!("https://{}", host_and_path);
+        }
+    }
+    url.to_string()
+}
+
+/// Load simple KEY=VALUE pairs from a `.env` file in the current directory
+/// into the process environment (only if not already set). Lines starting
+/// with `#` and blank lines are ignored. Values may be optionally quoted.
+pub fn load_dotenv() {
+    load_dotenv_from(Path::new(".env"));
+}
+
+/// Load simple KEY=VALUE pairs from the `.env`-style file at `path` into the
+/// process environment (only if the variable is not already set). Lines
+/// starting with `#` and blank lines are ignored; values may be optionally
+/// quoted. Returns `true` if the file existed and was read, `false` otherwise.
+pub fn load_dotenv_from(path: &Path) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    let Ok(content) = fs::read_to_string(path) else {
+        return false;
+    };
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        if let Some((key, value)) = line.split_once('=') {
+            let key = key.trim();
+            let mut value = value.trim();
+            if (value.starts_with('"') && value.ends_with('"'))
+                || (value.starts_with('\'') && value.ends_with('\''))
+            {
+                value = &value[1..value.len().saturating_sub(1)];
+            }
+            if std::env::var(key).is_err() {
+                std::env::set_var(key, value);
+            }
+        }
+    }
+    true
+}

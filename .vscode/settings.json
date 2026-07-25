@@ -1,0 +1,10 @@
+{
+    // Low-memory rust-analyzer config for this 1.9 GiB / no-swap dev container.
+    // The language server was being OOM-killed (SIGKILL) while priming caches
+    // for 200+ crates. These settings cap memory use so it stays alive.
+    "rust-analyzer.cachePriming.enable": false,
+    "rust-analyzer.numThreads": 2,
+    "rust-analyzer.check.command": "check",
+    "rust-analyzer.cargo.buildScripts.enable": true,
+    "rust-analyzer.lru.capacity": 64
+}
