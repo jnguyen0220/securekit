@@ -43,9 +43,9 @@ pub(crate) fn redact_secret(secret: &str) -> String {
 /// provided.
 pub(crate) fn github_authenticated_url(repo_url: &str, token: Option<&str>) -> Option<String> {
     match token {
-        Some(t) if repo_url.starts_with("https://github.com/") => Some(
-            repo_url.replacen("https://", &format!("https://x-access-token:{}@", t), 1),
-        ),
+        Some(t) if repo_url.starts_with("https://github.com/") => {
+            Some(repo_url.replacen("https://", &format!("https://x-access-token:{}@", t), 1))
+        }
         _ => None,
     }
 }

@@ -20,7 +20,11 @@ use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
-pub(crate) fn validate_secret(kind: &str, secret: &str, azure_active_probe: bool) -> Option<String> {
+pub(crate) fn validate_secret(
+    kind: &str,
+    secret: &str,
+    azure_active_probe: bool,
+) -> Option<String> {
     let status = match kind {
         "aws_access_key" => validate_aws_access_key(secret),
         "github_token" | "github_oauth" | "github_pat" => validate_github_token(secret),
@@ -216,7 +220,10 @@ fn parse_azure_connection_string(secret: &str) -> Option<AzureConnectionString> 
     })
 }
 
-fn validate_azure_storage_connection_string(secret: &str, azure_active_probe: bool) -> SecretValidity {
+fn validate_azure_storage_connection_string(
+    secret: &str,
+    azure_active_probe: bool,
+) -> SecretValidity {
     let Some(conn) = parse_azure_connection_string(secret) else {
         return SecretValidity::Invalid;
     };
@@ -462,7 +469,8 @@ fn validate_private_key(secret: &str) -> SecretValidity {
 
 fn validate_jwt(secret: &str) -> SecretValidity {
     let mut parts = secret.split('.');
-    let (Some(h), Some(p), Some(s), None) = (parts.next(), parts.next(), parts.next(), parts.next())
+    let (Some(h), Some(p), Some(s), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
     else {
         return SecretValidity::Invalid;
     };
@@ -597,8 +605,16 @@ fn b64url_decode(input: &str) -> Option<Vec<u8>> {
     for chunk in bytes.chunks_exact(4) {
         let a = b64_val(chunk[0])?;
         let b = b64_val(chunk[1])?;
-        let c = if chunk[2] == b'=' { 64 } else { b64_val(chunk[2])? as u8 };
-        let d = if chunk[3] == b'=' { 64 } else { b64_val(chunk[3])? as u8 };
+        let c = if chunk[2] == b'=' {
+            64
+        } else {
+            b64_val(chunk[2])? as u8
+        };
+        let d = if chunk[3] == b'=' {
+            64
+        } else {
+            b64_val(chunk[3])? as u8
+        };
 
         out.push(((a << 2) | (b >> 4)) as u8);
         if c != 64 {

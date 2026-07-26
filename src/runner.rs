@@ -131,7 +131,10 @@ pub async fn run_scan(cfg: ScanConfig) -> Result<()> {
             if let Err(e) = write_disclosure_report(dir, report, &token).await {
                 app::warn(
                     "scan",
-                    format!("failed to write disclosure report for {}: {}", report.repo, e),
+                    format!(
+                        "failed to write disclosure report for {}: {}",
+                        report.repo, e
+                    ),
                 );
             }
         }

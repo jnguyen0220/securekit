@@ -1,11 +1,11 @@
 //! Secret scanning core: the pattern catalogue, repository cloning, ignore
 //! rules, and the per-repository scan entry point ([`scan_repo`]).
 
+use crate::app;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use crate::app;
 use std::sync::{Once, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{collections::HashMap, collections::HashSet};
