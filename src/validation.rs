@@ -591,14 +591,14 @@ fn ymd_hms_to_unix(year: i32, month: u32, day: u32, hour: u32, min: u32, sec: u3
 
 fn b64url_decode(input: &str) -> Option<Vec<u8>> {
     let mut s = input.replace('-', "+").replace('_', "/");
-    while s.len() % 4 != 0 {
+    while !s.len().is_multiple_of(4) {
         s.push('=');
     }
 
     // Small local base64 decoder (standard alphabet), avoiding extra deps.
     let mut out = Vec::with_capacity(s.len() * 3 / 4);
     let bytes = s.as_bytes();
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return None;
     }
 
@@ -608,20 +608,20 @@ fn b64url_decode(input: &str) -> Option<Vec<u8>> {
         let c = if chunk[2] == b'=' {
             64
         } else {
-            b64_val(chunk[2])? as u8
+            b64_val(chunk[2])?
         };
         let d = if chunk[3] == b'=' {
             64
         } else {
-            b64_val(chunk[3])? as u8
+            b64_val(chunk[3])?
         };
 
-        out.push(((a << 2) | (b >> 4)) as u8);
+        out.push((a << 2) | (b >> 4));
         if c != 64 {
-            out.push(((b << 4) | (c >> 2)) as u8);
+            out.push((b << 4) | (c >> 2));
         }
         if d != 64 {
-            out.push(((c << 6) | d) as u8);
+            out.push((c << 6) | d);
         }
     }
 

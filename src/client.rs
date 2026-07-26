@@ -94,6 +94,11 @@ struct LocalReport {
     submit: SubmitReport,
 }
 
+struct ScanOptions {
+    validate_secrets: bool,
+    azure_active_probe: bool,
+}
+
 fn build_report(
     item_id: u64,
     repo: &str,
@@ -101,8 +106,7 @@ fn build_report(
     worker_id: &str,
     ignore_patterns: &[Regex],
     cache: &ScanCache,
-    validate_secrets: bool,
-    azure_active_probe: bool,
+    options: &ScanOptions,
 ) -> LocalReport {
     let clone_source = clone_url.unwrap_or(repo);
     match scan_repo(
@@ -111,8 +115,8 @@ fn build_report(
         ignore_patterns,
         cache,
         None,
-        validate_secrets,
-        azure_active_probe,
+        options.validate_secrets,
+        options.azure_active_probe,
     ) {
         Ok(r) => LocalReport {
             submit: SubmitReport {
@@ -250,6 +254,10 @@ pub async fn run_client(server_url: &str, worker_id: Option<String>) -> Result<(
     let claim_batch = config.claim_batch.max(1);
     let ignore_patterns = compile_ignore_patterns(&config.ignore_patterns)
         .context("server ignore pattern invalid")?;
+    let scan_options = ScanOptions {
+        validate_secrets: config.validate_secrets,
+        azure_active_probe: config.azure_active_probe,
+    };
 
     // Dedicated pool so parallel scanning doesn't fight the async runtime.
     let pool = rayon::ThreadPoolBuilder::new()
@@ -329,8 +337,7 @@ pub async fn run_client(server_url: &str, worker_id: Option<String>) -> Result<(
                         &worker_id,
                         &ignore_patterns,
                         &cache,
-                        config.validate_secrets,
-                        config.azure_active_probe,
+                        &scan_options,
                     ))
                 })
                 .collect()

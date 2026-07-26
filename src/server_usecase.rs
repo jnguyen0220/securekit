@@ -225,14 +225,12 @@ mod tests {
 
         fn enqueue(&self, repos: Vec<String>) {
             let mut q = self.pending.lock().unwrap();
-            let mut next_id = 10_000u64;
-            for repo in repos {
+            for (next_id, repo) in (10_000u64..).zip(repos) {
                 q.push_back(WorkItem {
                     id: next_id,
                     repo,
                     clone_url: None,
                 });
-                next_id += 1;
             }
         }
 

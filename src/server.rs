@@ -311,6 +311,16 @@ async fn claim(State(app): State<AppState>, Json(req): Json<ClaimRequest>) -> Js
     Json(app.claim_service.claim(&req).await)
 }
 
+async fn report(State(app): State<AppState>, Json(report): Json<SubmitReport>) -> Json<Ack> {
+    Json(app.report_service.submit(report))
+}
+
+async fn stats(State(app): State<AppState>) -> Json<StoreStats> {
+    let mut s = app.store.stats();
+    s.active_workers = app.registry.active_count();
+    Json(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,14 +338,4 @@ mod tests {
         assert_eq!(fair_claim_count(0, 0, 0), 1);
         assert_eq!(fair_claim_count(MAX_CLAIM + 50, 10_000, 1), MAX_CLAIM);
     }
-}
-
-async fn report(State(app): State<AppState>, Json(report): Json<SubmitReport>) -> Json<Ack> {
-    Json(app.report_service.submit(report))
-}
-
-async fn stats(State(app): State<AppState>) -> Json<StoreStats> {
-    let mut s = app.store.stats();
-    s.active_workers = app.registry.active_count();
-    Json(s)
 }
