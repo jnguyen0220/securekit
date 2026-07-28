@@ -23,9 +23,10 @@ use crate::util::{current_unix_time, read_list_file, redact_secret};
 fn load_repo_list(repos: &[String], repo_file: Option<&Path>) -> Result<Vec<String>> {
     let mut repos = repos.to_vec();
     if let Some(path) = repo_file {
-        repos.extend(read_list_file(path).with_context(|| {
-            format!("failed to read repo file: {}", path.display())
-        })?);
+        repos.extend(
+            read_list_file(path)
+                .with_context(|| format!("failed to read repo file: {}", path.display()))?,
+        );
     }
     Ok(repos)
 }
