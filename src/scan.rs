@@ -17,7 +17,10 @@ use walkdir::WalkDir;
 
 use crate::cache::{find_cached_sha, get_repo_commit_sha, ScanCache};
 use crate::report::{Finding, Report};
-use crate::util::{fingerprint_secret, github_authenticated_url, redact_url_credentials};
+use crate::util::{
+    fingerprint_secret, github_authenticated_url, redact_url_credentials, u64_from_env,
+    usize_from_env_min,
+};
 use crate::validation::validate_secret;
 
 /// Built-in ignore rule that filters common placeholder/example credentials.
@@ -35,26 +38,23 @@ const DEFAULT_CLONE_TMP_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 const DEFAULT_CLONE_RETRIES: u32 = 2;
 
 fn validate_parallelism() -> usize {
-    std::env::var("SECUREKIT_VALIDATE_PARALLELISM")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n >= 1)
-        .map(|n| n.min(MAX_VALIDATE_PARALLELISM))
-        .unwrap_or(DEFAULT_VALIDATE_PARALLELISM)
+    let configured = usize_from_env_min(
+        "SECUREKIT_VALIDATE_PARALLELISM",
+        DEFAULT_VALIDATE_PARALLELISM,
+        1,
+    );
+    configured.min(MAX_VALIDATE_PARALLELISM)
 }
 
 fn clone_tmp_max_age_secs() -> u64 {
-    std::env::var("SECUREKIT_CLONE_TMP_MAX_AGE_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_CLONE_TMP_MAX_AGE_SECS)
+    u64_from_env(
+        "SECUREKIT_CLONE_TMP_MAX_AGE_SECS",
+        DEFAULT_CLONE_TMP_MAX_AGE_SECS,
+    )
 }
 
 fn clone_retries() -> u32 {
-    std::env::var("SECUREKIT_CLONE_RETRIES")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(DEFAULT_CLONE_RETRIES)
+    u64_from_env("SECUREKIT_CLONE_RETRIES", u64::from(DEFAULT_CLONE_RETRIES)) as u32
 }
 
 /// Build the *uncompiled* list of ignore regexes from the built-in defaults

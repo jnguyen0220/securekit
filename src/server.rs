@@ -35,7 +35,6 @@
 //! implementing that trait and constructing it in [`build_store`].
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -62,6 +61,7 @@ use crate::server_usecase::{
     ClaimService, RepoCacheWriter, ReportService, WorkerLifecycleService, WorkerSettings,
 };
 use crate::store::{FileTargetStore, TargetStore};
+use crate::util::{bool_from_env, current_unix_time, path_from_env, path_or_default_from_env};
 use crate::{
     cache::find_cached_sha, cache::load_cache, cache::save_cache, cache::CachedRepo,
     cache::ScanCache,
@@ -70,6 +70,8 @@ use crate::{
 /// Hard cap on how many items a single claim can lease, to keep one greedy
 /// client from draining the queue.
 const MAX_CLAIM: usize = 100;
+const CACHE_FLUSH_EVERY_UPDATES: usize = 25;
+const CACHE_FLUSH_MAX_INTERVAL_SECS: u64 = 5;
 
 type SharedStore = Arc<dyn TargetStore>;
 
@@ -85,47 +87,73 @@ struct AppState {
 
 /// Server-owned repository cache keyed by repo URL -> last scanned commit SHA.
 struct RepoCache {
-    inner: Mutex<ScanCache>,
+    inner: Mutex<RepoCacheState>,
+}
+
+struct RepoCacheState {
+    cache: ScanCache,
+    dirty_updates: usize,
+    last_flush: u64,
 }
 
 impl RepoCache {
     fn from_disk() -> Result<Self> {
+        let now = current_unix_time();
         Ok(Self {
-            inner: Mutex::new(load_cache()?),
+            inner: Mutex::new(RepoCacheState {
+                cache: load_cache()?,
+                dirty_updates: 0,
+                last_flush: now,
+            }),
         })
     }
 
     fn get_sha(&self, repo: &str) -> Option<String> {
-        let cache = self.inner.lock().unwrap();
-        find_cached_sha(repo, &cache)
+        let state = self.inner.lock().unwrap();
+        find_cached_sha(repo, &state.cache)
     }
 
     fn enum_cursor(&self) -> Option<u64> {
-        let cache = self.inner.lock().unwrap();
-        cache.enum_cursor
+        let state = self.inner.lock().unwrap();
+        state.cache.enum_cursor
     }
 
     fn set_enum_cursor(&self, cursor: u64) -> Result<()> {
-        let mut cache = self.inner.lock().unwrap();
-        cache.enum_cursor = Some(cursor);
-        save_cache(&cache)
+        let mut state = self.inner.lock().unwrap();
+        state.cache.enum_cursor = Some(cursor);
+        state.dirty_updates = 0;
+        state.last_flush = current_unix_time();
+        save_cache(&state.cache)
     }
 
     fn upsert_sha(&self, repo: &str, sha: &str) -> Result<()> {
-        let mut cache = self.inner.lock().unwrap();
-        let mut by_url: HashMap<String, CachedRepo> =
-            cache.repos.drain(..).map(|r| (r.url.clone(), r)).collect();
-        by_url.insert(
-            repo.to_string(),
-            CachedRepo {
-                url: repo.to_string(),
-                commit_sha: sha.to_string(),
-                timestamp: crate::util::current_unix_time(),
-            },
-        );
-        cache.repos = by_url.into_values().collect();
-        cache.rebuild_index();
-        save_cache(&cache)
+        let mut state = self.inner.lock().unwrap();
+        {
+            let cache = &mut state.cache;
+            let mut by_url: HashMap<String, CachedRepo> =
+                cache.repos.drain(..).map(|r| (r.url.clone(), r)).collect();
+            by_url.insert(
+                repo.to_string(),
+                CachedRepo {
+                    url: repo.to_string(),
+                    commit_sha: sha.to_string(),
+                    timestamp: current_unix_time(),
+                },
+            );
+            cache.repos = by_url.into_values().collect();
+            cache.rebuild_index();
+        }
+
+        state.dirty_updates += 1;
+        let now = current_unix_time();
+        let should_flush = state.dirty_updates >= CACHE_FLUSH_EVERY_UPDATES
+            || now.saturating_sub(state.last_flush) >= CACHE_FLUSH_MAX_INTERVAL_SECS;
+        if should_flush {
+            save_cache(&state.cache)?;
+            state.dirty_updates = 0;
+            state.last_flush = now;
+        }
+        Ok(())
     }
 }
 
@@ -145,11 +173,21 @@ impl RepoCacheOrchestration for RepoCache {
     }
 }
 
+impl Drop for RepoCache {
+    fn drop(&mut self) {
+        let Ok(state) = self.inner.get_mut() else {
+            return;
+        };
+        if state.dirty_updates > 0 {
+            let _ = save_cache(&state.cache);
+            state.dirty_updates = 0;
+        }
+    }
+}
+
 /// Read configuration from the environment and build the shared store.
 fn build_store() -> Result<SharedStore> {
-    let results_path: PathBuf = std::env::var("SECUREKIT_RESULTS_FILE")
-        .unwrap_or_else(|_| "results.jsonl".to_string())
-        .into();
+    let results_path = path_or_default_from_env("SECUREKIT_RESULTS_FILE", "results.jsonl");
 
     // Always use dynamic enqueue path so both static-list and live-enumeration
     // flows share the same server-side cache filtering behavior.
@@ -160,12 +198,8 @@ fn build_store() -> Result<SharedStore> {
 /// plus an optional `SECUREKIT_IGNORE_FILE`), validating that each pattern
 /// compiles before it is handed out.
 fn build_ignore_patterns() -> Result<Vec<String>> {
-    let ignore_file = std::env::var("SECUREKIT_IGNORE_FILE")
-        .ok()
-        .map(PathBuf::from);
-    let no_default = std::env::var("SECUREKIT_NO_DEFAULT_IGNORES")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false);
+    let ignore_file = path_from_env("SECUREKIT_IGNORE_FILE");
+    let no_default = bool_from_env("SECUREKIT_NO_DEFAULT_IGNORES", false);
 
     let patterns = load_ignore_pattern_strings(no_default, &[], ignore_file.as_deref())?;
     // Fail fast on a bad pattern rather than shipping it to every client.

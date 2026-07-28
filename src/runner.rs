@@ -2,7 +2,6 @@
 //! enumeration, and/or search), scan in parallel, then emit results and
 //! optional disclosure reports.
 
-use std::fs;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
@@ -19,19 +18,14 @@ use crate::github::enumerate_public_repos;
 use crate::github_auth::TokenManager;
 use crate::report::{write_output, Report};
 use crate::scan::{load_ignore_patterns, scan_repo};
-use crate::util::{current_unix_time, redact_secret};
+use crate::util::{current_unix_time, read_list_file, redact_secret};
 
 fn load_repo_list(repos: &[String], repo_file: Option<&Path>) -> Result<Vec<String>> {
     let mut repos = repos.to_vec();
     if let Some(path) = repo_file {
-        let content = fs::read_to_string(path)
-            .with_context(|| format!("failed to read repo file: {}", path.display()))?;
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if !trimmed.is_empty() {
-                repos.push(trimmed.to_string());
-            }
-        }
+        repos.extend(read_list_file(path).with_context(|| {
+            format!("failed to read repo file: {}", path.display())
+        })?);
     }
     Ok(repos)
 }

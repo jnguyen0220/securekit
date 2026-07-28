@@ -12,6 +12,7 @@ use crate::github::enumerate_public_repos_page;
 use crate::github_auth::TokenManager;
 use crate::registry::WorkerRegistry;
 use crate::store::TargetStore;
+use crate::util::read_list_file;
 
 const ENUM_QUEUE_HIGH_WATER: usize = 5_000;
 
@@ -30,17 +31,7 @@ pub(crate) trait RepoCacheOrchestration: Send + Sync {
 /// Load repositories from a text list file (one per line), ignoring blanks and
 /// `#` comments.
 pub(crate) fn read_repo_list(path: &Path) -> Result<Vec<String>> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("read list file {} failed", path.display()))?;
-    let mut repos = Vec::new();
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        repos.push(trimmed.to_string());
-    }
-    Ok(repos)
+    read_list_file(path)
 }
 
 pub(crate) fn load_enum_cursor_checkpoint(path: &Path) -> Option<u64> {

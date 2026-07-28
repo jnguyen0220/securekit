@@ -3,8 +3,10 @@
 
 use std::fs;
 use std::path::Path;
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
 /// Seconds since the UNIX epoch (0 if the clock is set before it).
@@ -58,6 +60,58 @@ pub(crate) fn redact_url_credentials(url: &str) -> String {
         }
     }
     url.to_string()
+}
+
+/// Parse a boolean environment variable with a default fallback.
+pub(crate) fn bool_from_env(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(default)
+}
+
+/// Parse a usize environment variable with a minimum accepted value.
+pub(crate) fn usize_from_env_min(key: &str, default: usize, min: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= min)
+        .unwrap_or(default)
+}
+
+/// Parse a u64 environment variable with a default fallback.
+pub(crate) fn u64_from_env(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+/// Parse an optional path environment variable.
+pub(crate) fn path_from_env(key: &str) -> Option<PathBuf> {
+    std::env::var(key).ok().map(PathBuf::from)
+}
+
+/// Parse a path environment variable, using a default path when missing.
+pub(crate) fn path_or_default_from_env(key: &str, default: &str) -> PathBuf {
+    std::env::var(key)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(default))
+}
+
+/// Read a list file with one entry per line, ignoring blanks and `#` comments.
+pub(crate) fn read_list_file(path: &Path) -> Result<Vec<String>> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("read list file {} failed", path.display()))?;
+    let mut rows = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        rows.push(trimmed.to_string());
+    }
+    Ok(rows)
 }
 
 /// Load simple KEY=VALUE pairs from a `.env` file in the current directory

@@ -11,6 +11,7 @@
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
 use serde_json::Value;
+use std::sync::OnceLock;
 use std::time::SystemTime;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -60,10 +61,15 @@ enum SecretValidity {
 }
 
 fn http_client() -> Option<Client> {
-    Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .build()
-        .ok()
+    static CLIENT: OnceLock<Option<Client>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            Client::builder()
+                .timeout(std::time::Duration::from_secs(8))
+                .build()
+                .ok()
+        })
+        .clone()
 }
 
 fn validate_aws_access_key(access_key_id: &str) -> SecretValidity {

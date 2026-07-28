@@ -5,6 +5,8 @@
 
 use std::sync::OnceLock;
 
+use crate::util::bool_from_env;
+
 /// Log severity used by the lightweight logger.
 #[derive(Debug, Clone, Copy)]
 pub enum LogLevel {
@@ -23,10 +25,7 @@ static LOG_POLICY: OnceLock<LogPolicy> = OnceLock::new();
 
 fn policy() -> &'static LogPolicy {
     LOG_POLICY.get_or_init(|| LogPolicy {
-        verbose: std::env::var("SECUREKIT_VERBOSE")
-            .ok()
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false),
+        verbose: bool_from_env("SECUREKIT_VERBOSE", false),
     })
 }
 
