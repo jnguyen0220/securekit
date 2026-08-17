@@ -22,6 +22,7 @@ pub mod app;
 mod cache;
 mod config;
 mod disclosure;
+mod git;
 mod github;
 mod lifecycle;
 mod report;

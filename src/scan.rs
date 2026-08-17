@@ -5,7 +5,6 @@ use crate::app;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Once, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{collections::HashMap, collections::HashSet};
@@ -431,43 +430,32 @@ fn clone_repo(repo_url: &str, token: Option<&str>) -> Result<PathBuf> {
 
     for attempt in 0..=retry_policy.max_retries {
         let temp_dir = create_unique_clone_dir(repo_name)?;
-        let output = Command::new("git")
-            .arg("clone")
-            .arg("--depth")
-            .arg("1")
-            .arg(&clone_url)
-            .arg(&temp_dir)
-            .output()
-            .with_context(|| format!("failed to run git clone for {}", redacted_repo))?;
+        match crate::git::shallow_clone(&clone_url, &temp_dir) {
+            Ok(()) => return Ok(temp_dir),
+            Err(e) => {
+                let message = format!("{:#}", e);
+                let retryable = clone_error_is_retryable(&message);
+                let _ = fs::remove_dir_all(&temp_dir);
 
-        if output.status.success() {
-            return Ok(temp_dir);
+                if retryable && retry_policy.can_retry(attempt) {
+                    let delay = retry_policy.delay_for_attempt(attempt);
+                    app::warn(
+                        "scan",
+                        format!(
+                            "git clone retry {}/{} for {}: {}",
+                            attempt + 1,
+                            retry_policy.max_retries,
+                            redacted_repo,
+                            message
+                        ),
+                    );
+                    std::thread::sleep(delay);
+                    continue;
+                }
+
+                anyhow::bail!("git clone failed for {}: {}", redacted_repo, message);
+            }
         }
-
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let retryable = clone_error_is_retryable(&stderr);
-        let _ = fs::remove_dir_all(&temp_dir);
-
-        if retryable && retry_policy.can_retry(attempt) {
-            let delay = retry_policy.delay_for_attempt(attempt);
-            app::warn(
-                "scan",
-                format!(
-                    "git clone retry {}/{} for {}: {}",
-                    attempt + 1,
-                    retry_policy.max_retries,
-                    redacted_repo,
-                    stderr
-                ),
-            );
-            std::thread::sleep(delay);
-            continue;
-        }
-
-        if stderr.is_empty() {
-            anyhow::bail!("git clone failed for {}", redacted_repo);
-        }
-        anyhow::bail!("git clone failed for {}: {}", redacted_repo, stderr);
     }
 
     anyhow::bail!("git clone failed for {}", redacted_repo)
@@ -479,31 +467,15 @@ fn clone_repo(repo_url: &str, token: Option<&str>) -> Result<PathBuf> {
 /// Returns `Ok(None)` when no refs/HEAD are available (for example, an empty
 /// repository).
 fn resolve_repo_head_sha(repo: &str, token: Option<&str>) -> Result<Option<String>> {
-    let output = if Path::new(repo).exists() {
-        Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .arg("rev-parse")
-            .arg("HEAD")
-            .output()
-            .with_context(|| format!("failed to read local HEAD for {}", repo))?
+    if Path::new(repo).exists() {
+        crate::git::local_head_sha(Path::new(repo))
+            .with_context(|| format!("failed to read local HEAD for {}", repo))
     } else {
         let repo_for_lookup =
             github_authenticated_url(repo, token).unwrap_or_else(|| repo.to_string());
-        Command::new("git")
-            .arg("ls-remote")
-            .arg(&repo_for_lookup)
-            .arg("HEAD")
-            .output()
-            .with_context(|| format!("failed to read remote HEAD for {}", repo))?
-    };
-
-    if !output.status.success() {
-        anyhow::bail!("failed to resolve HEAD for {}", repo);
+        crate::git::remote_head_sha(&repo_for_lookup)
+            .with_context(|| format!("failed to read remote HEAD for {}", repo))
     }
-
-    let text = String::from_utf8(output.stdout).context("failed to parse git output")?;
-    Ok(text.split_whitespace().next().map(|s| s.to_string()))
 }
 
 fn absolutize_finding_paths(repo: &str, findings: &mut [Finding]) {

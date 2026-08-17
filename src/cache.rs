@@ -7,7 +7,6 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -63,21 +62,9 @@ pub(crate) fn save_cache(cache: &ScanCache) -> Result<()> {
 }
 
 pub(crate) fn get_repo_commit_sha(repo_dir: &Path) -> Result<String> {
-    let output = Command::new("git")
-        .arg("rev-parse")
-        .arg("HEAD")
-        .current_dir(repo_dir)
-        .output()
-        .context("failed to get commit SHA")?;
-
-    if !output.status.success() {
-        anyhow::bail!("failed to get commit SHA from {}", repo_dir.display());
-    }
-
-    Ok(String::from_utf8(output.stdout)
-        .context("failed to parse commit SHA")?
-        .trim()
-        .to_string())
+    crate::git::local_head_sha(repo_dir)
+        .with_context(|| format!("failed to get commit SHA from {}", repo_dir.display()))?
+        .ok_or_else(|| anyhow::anyhow!("no HEAD commit in {}", repo_dir.display()))
 }
 
 pub(crate) fn find_cached_sha(repo_url: &str, cache: &ScanCache) -> Option<String> {

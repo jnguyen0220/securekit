@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -81,54 +80,12 @@ fn should_skip_repo_on_head_error(msg: &str) -> bool {
 /// Returns `Ok(None)` when the target exists but has no refs yet (for example,
 /// a brand-new empty repository with no default branch).
 fn repo_head_sha(repo: &str, git_head_timeout_secs: u64) -> Result<Option<String>> {
-    let output = if Path::new(repo).exists() {
-        Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .arg("rev-parse")
-            .arg("HEAD")
-            .output()
-            .with_context(|| format!("read local HEAD for {} failed", repo))?
+    if Path::new(repo).exists() {
+        crate::git::local_head_sha(Path::new(repo))
+            .with_context(|| format!("read local HEAD for {} failed", repo))
     } else {
-        run_git_ls_remote_head_with_timeout(repo, git_head_timeout_secs)?
-    };
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if stderr.is_empty() {
-            anyhow::bail!("resolve HEAD SHA failed for {}", repo);
-        }
-        anyhow::bail!("resolve HEAD SHA failed for {}: {}", repo, stderr);
+        crate::git::remote_head_sha_timed(repo, Duration::from_secs(git_head_timeout_secs))
     }
-
-    let text = String::from_utf8(output.stdout).context("git output decode failed")?;
-    let sha = text.split_whitespace().next();
-    if let Some(sha) = sha {
-        Ok(Some(sha.to_string()))
-    } else {
-        Ok(None)
-    }
-}
-
-fn run_git_ls_remote_head_with_timeout(repo: &str, timeout_secs: u64) -> Result<Output> {
-    let output = Command::new("timeout")
-        .arg(format!("{}s", timeout_secs))
-        .arg("git")
-        .arg("ls-remote")
-        .arg(repo)
-        .arg("HEAD")
-        .output()
-        .with_context(|| format!("start timed HEAD check for {} failed", repo))?;
-
-    if output.status.code() == Some(124) {
-        anyhow::bail!(
-            "read remote HEAD for {} timed out after {}s",
-            repo,
-            timeout_secs
-        );
-    }
-
-    Ok(output)
 }
 
 /// Filter repositories so only unseen or changed-HEAD targets are enqueued.
