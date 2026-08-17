@@ -125,6 +125,7 @@ where
         let repo = report.repo.clone();
         let sha = report.commit_sha.clone();
         let finding_count = report.finding_count;
+        let has_leak = report.has_leak;
         let reason = report
             .error
             .as_deref()
@@ -139,8 +140,10 @@ where
 
         match self.store.complete(report) {
             Ok(()) => {
-                app::info(
+                let important = has_leak || status == "skip";
+                app::progress(
                     "server",
+                    important,
                     format!(
                         "{} | repo={} | status={} | findings={}{}",
                         worker_id, repo, status, finding_count, reason

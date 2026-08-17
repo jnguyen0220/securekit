@@ -477,8 +477,10 @@ pub async fn run_client(server_url: &str, worker_id: Option<String>) -> Result<(
                 .map(|e| format!(" | reason: {}", e))
                 .unwrap_or_default();
             let server_suffix = if ack.ok { "" } else { " | server_rejected" };
-            app::info(
+            let important = report.has_leak || report.error.is_some() || !ack.ok;
+            app::progress(
                 "client",
+                important,
                 format!(
                     "{} | repo={} | status={} | findings={}{}{}",
                     worker_id,
