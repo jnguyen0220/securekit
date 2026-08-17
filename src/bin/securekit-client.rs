@@ -28,7 +28,7 @@ struct Args {
     #[arg(
         long,
         value_name = "ID",
-        help = "Stable worker id (defaults to an auto-generated one)"
+        help = "Stable worker id; overrides the auto-generated per-client GUID"
     )]
     worker_id: Option<String>,
 }

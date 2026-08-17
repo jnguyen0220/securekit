@@ -20,6 +20,7 @@
 //! finding is converted into a [`WireFinding`] carrying only the masked value,
 //! a SHA-256 fingerprint, and the file location before being sent upstream.
 
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,9 +39,11 @@ use crate::protocol::{
 use crate::{compile_ignore_patterns, scan_repo, ScanCache};
 
 /// Shortest and longest backoff while waiting for the server to enumerate more
-/// work into an empty claim queue.
+/// work into an empty claim queue. The cap is kept modest so a worker that
+/// misses a few empty polls recovers quickly instead of being starved out of
+/// every fresh batch by peers that are polling faster.
 const MIN_IDLE_BACKOFF: Duration = Duration::from_secs(2);
-const MAX_IDLE_BACKOFF: Duration = Duration::from_secs(30);
+const MAX_IDLE_BACKOFF: Duration = Duration::from_secs(10);
 const MAX_REPORT_CONCURRENCY: usize = 16;
 
 /// Wait for a process termination signal.
@@ -79,13 +82,48 @@ fn spawn_shutdown_listener() -> (watch::Receiver<bool>, Arc<AtomicBool>) {
     (rx, shutdown)
 }
 
-/// Generate a reasonably unique worker id when the user does not supply one.
-fn default_worker_id() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("worker-{}-{}", std::process::id(), nanos)
+/// Generate a random RFC 4122 version-4 GUID (e.g.
+/// `3f2504e0-4f89-41d3-9a0c-0305e82c3301`) used as the default worker id.
+///
+/// Every client gets a globally-unique id without coordination, so two bots
+/// never collide in the server registry. Entropy is mixed from the clock, pid,
+/// and a stack address and expanded with SplitMix64 — enough to avoid
+/// collisions across a fleet without pulling in a uuid/rand dependency.
+fn generate_guid() -> String {
+    let seed = {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let pid = std::process::id() as u64;
+        let stack_marker = &nanos as *const _ as u64;
+        nanos ^ pid.rotate_left(32) ^ stack_marker
+    };
+
+    let mut state = seed;
+    let mut next = || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&next().to_le_bytes());
+    bytes[8..].copy_from_slice(&next().to_le_bytes());
+    // Stamp the version (4) and RFC 4122 variant bits.
+    bytes[6] = (bytes[6] & 0x0F) | 0x40;
+    bytes[8] = (bytes[8] & 0x3F) | 0x80;
+
+    let mut guid = String::with_capacity(36);
+    for (i, byte) in bytes.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            guid.push('-');
+        }
+        let _ = write!(guid, "{:02x}", byte);
+    }
+    guid
 }
 
 /// Scan a single (public) repository and build the redacted report to send
@@ -225,6 +263,26 @@ fn report_concurrency(scan_workers: usize, claim_batch: usize) -> usize {
         .clamp(1, MAX_REPORT_CONCURRENCY)
 }
 
+/// Pick a randomized wait in `[MIN_IDLE_BACKOFF, cap]` ("full jitter").
+///
+/// Randomizing the idle wait stops the fleet from polling in lock-step, which
+/// otherwise lets a couple of workers repeatedly win every freshly enumerated
+/// batch while others starve. Entropy comes from the wall-clock nanosecond,
+/// which differs per process and per call — good enough to spread polls out.
+fn jittered_backoff(cap: Duration) -> Duration {
+    let min_ms = MIN_IDLE_BACKOFF.as_millis() as u64;
+    let cap_ms = cap.as_millis() as u64;
+    if cap_ms <= min_ms {
+        return cap;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let span = cap_ms - min_ms;
+    Duration::from_millis(min_ms + nanos % (span + 1))
+}
+
 /// Best-effort unregister call for graceful client shutdown.
 async fn unregister(http: &reqwest::Client, base: &str, worker_id: &str) -> Result<()> {
     let ack: Ack = http
@@ -252,7 +310,7 @@ async fn unregister(http: &reqwest::Client, base: &str, worker_id: &str) -> Resu
 /// parallel, and reports redacted results until the server's queue is drained.
 pub async fn run_client(server_url: &str, worker_id: Option<String>) -> Result<()> {
     let base = server_url.trim_end_matches('/').to_string();
-    let worker_id = worker_id.unwrap_or_else(default_worker_id);
+    let worker_id = worker_id.unwrap_or_else(generate_guid);
     let http = reqwest::Client::new();
     // Client stays stateless: server owns repo cache/filtering decisions.
     let cache = ScanCache::default();
@@ -319,12 +377,18 @@ pub async fn run_client(server_url: &str, worker_id: Option<String>) -> Result<(
                 break;
             }
             // Queue momentarily empty; wait for the server to enumerate more.
+            // Use jittered ("full jitter") backoff so the fleet desynchronizes:
+            // without it, whichever workers first win work keep polling on a
+            // short interval and monopolize every fresh batch, starving peers
+            // whose backoff has grown. Jitter gives each worker a fair chance
+            // to be the one polling when new work arrives.
+            let wait = jittered_backoff(idle_backoff);
             tokio::select! {
                 _ = shutdown_rx.changed() => {
                     terminated_by_signal = true;
                     break;
                 }
-                _ = tokio::time::sleep(idle_backoff) => {}
+                _ = tokio::time::sleep(wait) => {}
             }
             idle_backoff = (idle_backoff * 2).min(MAX_IDLE_BACKOFF);
             continue;
