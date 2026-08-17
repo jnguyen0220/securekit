@@ -143,6 +143,13 @@ to supply a GitHub token and configure server mode. See
 # GitHub auth (either variable works)
 GITHUB_TOKEN=ghp_your_token_here
 
+# Optional request identity for long-running API clients
+# SECUREKIT_USER_AGENT=securekit/1.0 (+https://example.org/security)
+# SECUREKIT_USER_AGENT_CONTACT=security@example.org
+
+# Optional GitHub API retry tuning (default: 3 retries for 5xx)
+# SECUREKIT_GITHUB_5XX_RETRIES=3
+
 # Server mode
 SECUREKIT_BIND=127.0.0.1:8080
 SECUREKIT_LIST_FILE=repos.txt
@@ -178,6 +185,12 @@ Installation tokens are **auto-refreshed**: the scanner re-mints the token as it
 nears its ~1 hour expiry (and immediately on a `401 Unauthorized`), so
 long-running crawls, enumeration, and client bots keep authenticating without
 restarts.
+
+For long-running automation, set a clear request identity using
+`SECUREKIT_USER_AGENT` (or `SECUREKIT_USER_AGENT_CONTACT` with the default
+`securekit/<version>` format). GitHub API requests also retry transient `5xx`
+responses with exponential backoff and jitter; tune retry count with
+`SECUREKIT_GITHUB_5XX_RETRIES`.
 
 When a token is available (App or PAT), clones of `https://github.com/...`
 repositories are authenticated, which raises rate limits and allows cloning
@@ -246,7 +259,7 @@ The server exposes:
 | GET    | `/health` | liveness probe             |
 | POST   | `/claim`  | lease work items           |
 | POST   | `/report` | submit redacted findings   |
-| GET    | `/stats`  | queue snapshot             |
+| GET    | `/stats`  | queue snapshot + perf summary |
 
 Run one or more clients pointing at the server:
 

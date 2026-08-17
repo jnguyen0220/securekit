@@ -27,7 +27,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use regex::Regex;
-use tokio::sync::watch;
+use tokio::sync::{watch, Semaphore};
+use tokio::task::JoinSet;
 
 use crate::app;
 use crate::protocol::{
@@ -40,6 +41,7 @@ use crate::{compile_ignore_patterns, scan_repo, ScanCache};
 /// work into an empty claim queue.
 const MIN_IDLE_BACKOFF: Duration = Duration::from_secs(2);
 const MAX_IDLE_BACKOFF: Duration = Duration::from_secs(30);
+const MAX_REPORT_CONCURRENCY: usize = 16;
 
 /// Wait for a process termination signal.
 async fn shutdown_signal() {
@@ -136,6 +138,7 @@ fn build_report(
                         fingerprint: f.fingerprint.clone(),
                         file: f.file.clone(),
                         validity: f.validity.clone(),
+                        validity_reason: f.validity_reason.clone(),
                     })
                     .collect(),
                 commit_sha: r.commit_sha,
@@ -214,6 +217,13 @@ fn spawn_heartbeat(
             }
         }
     })
+}
+
+fn report_concurrency(scan_workers: usize, claim_batch: usize) -> usize {
+    scan_workers
+        .min(claim_batch)
+        .max(1)
+        .min(MAX_REPORT_CONCURRENCY)
 }
 
 /// Best-effort unregister call for graceful client shutdown.
@@ -323,6 +333,7 @@ pub async fn run_client(server_url: &str, worker_id: Option<String>) -> Result<(
         idle_backoff = MIN_IDLE_BACKOFF;
 
         // Scan leased repos in parallel on the rayon pool.
+        let scan_started = std::time::Instant::now();
         let local_reports: Vec<LocalReport> = pool.install(|| {
             resp.items
                 .par_iter()
@@ -342,13 +353,26 @@ pub async fn run_client(server_url: &str, worker_id: Option<String>) -> Result<(
                 })
                 .collect()
         });
+        app::debug(
+            "client",
+            format!(
+                "batch scan complete | repos={} | elapsed_ms={}",
+                local_reports.len(),
+                scan_started.elapsed().as_millis()
+            ),
+        );
 
         if shutdown_flag.load(Ordering::Relaxed) {
             terminated_by_signal = true;
             break;
         }
 
-        // Report results sequentially (async I/O back to the server).
+        // Report results with bounded concurrency (async I/O back to the server).
+        let concurrency = report_concurrency(scan_workers, claim_batch);
+        let limiter = Arc::new(Semaphore::new(concurrency));
+        let mut report_tasks: JoinSet<Result<(SubmitReport, Ack)>> = JoinSet::new();
+        let report_started = std::time::Instant::now();
+
         for local in local_reports {
             if shutdown_flag.load(Ordering::Relaxed) {
                 terminated_by_signal = true;
@@ -356,16 +380,30 @@ pub async fn run_client(server_url: &str, worker_id: Option<String>) -> Result<(
             }
 
             let report = local.submit;
+            let http = http.clone();
+            let base = base.clone();
+            let limiter = Arc::clone(&limiter);
+            report_tasks.spawn(async move {
+                let _permit = limiter
+                    .acquire_owned()
+                    .await
+                    .context("report semaphore acquire failed")?;
+                let ack: Ack = http
+                    .post(format!("{}/report", base))
+                    .json(&report)
+                    .send()
+                    .await
+                    .with_context(|| format!("report submit failed for {}", report.repo))?
+                    .json()
+                    .await
+                    .context("report ack decode failed")?;
+                Ok((report, ack))
+            });
+        }
 
-            let ack: Ack = http
-                .post(format!("{}/report", base))
-                .json(&report)
-                .send()
-                .await
-                .with_context(|| format!("report submit failed for {}", report.repo))?
-                .json()
-                .await
-                .context("report ack decode failed")?;
+        while let Some(joined) = report_tasks.join_next().await {
+            let result = joined.context("report task join failed")??;
+            let (report, ack) = result;
 
             scanned += 1;
             let status = app::scan_status(report.error.is_some(), report.has_leak);
@@ -389,6 +427,14 @@ pub async fn run_client(server_url: &str, worker_id: Option<String>) -> Result<(
                 ),
             );
         }
+        app::debug(
+            "client",
+            format!(
+                "batch report complete | elapsed_ms={} | concurrency={}",
+                report_started.elapsed().as_millis(),
+                concurrency
+            ),
+        );
 
         if terminated_by_signal {
             break;

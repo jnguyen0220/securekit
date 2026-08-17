@@ -256,6 +256,7 @@ mod tests {
                 done: *self.completed.lock().unwrap(),
                 repos_with_leaks: 0,
                 active_workers: 0,
+                perf: None,
             }
         }
     }

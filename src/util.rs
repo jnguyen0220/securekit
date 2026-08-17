@@ -4,6 +4,7 @@
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -60,6 +61,88 @@ pub(crate) fn redact_url_credentials(url: &str) -> String {
         }
     }
     url.to_string()
+}
+
+/// Build the GitHub User-Agent header used by API requests.
+///
+/// Prefer setting `SECUREKIT_USER_AGENT` explicitly. If it is unset, we fall
+/// back to `securekit/<version>` and append an optional contact token from
+/// `SECUREKIT_USER_AGENT_CONTACT` (for example, an email or docs URL).
+pub(crate) fn github_user_agent() -> String {
+    if let Some(explicit) = std::env::var("SECUREKIT_USER_AGENT")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        return explicit;
+    }
+
+    let mut ua = format!("securekit/{}", env!("CARGO_PKG_VERSION"));
+    if let Some(contact) = std::env::var("SECUREKIT_USER_AGENT_CONTACT")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        ua.push_str(&format!(" ({})", contact));
+    }
+    ua
+}
+
+/// Add bounded jitter to a base delay to avoid synchronized retries.
+pub(crate) fn jittered_delay(base: Duration, max_jitter: Duration) -> Duration {
+    let jitter_ms = max_jitter.as_millis() as u64;
+    if jitter_ms == 0 {
+        return base;
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let salt = now ^ ((std::process::id() as u64) << 16);
+    let offset_ms = salt % (jitter_ms + 1);
+    base + Duration::from_millis(offset_ms)
+}
+
+/// Shared retry/backoff policy used by network and git operations.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RetryPolicy {
+    /// Number of retries after the initial attempt.
+    pub(crate) max_retries: u32,
+    /// Base delay before the first retry.
+    pub(crate) base_delay: Duration,
+    /// Maximum exponent used by exponential backoff.
+    pub(crate) max_exponent: u32,
+    /// Maximum random jitter added to each computed delay.
+    pub(crate) jitter: Duration,
+}
+
+impl RetryPolicy {
+    pub(crate) fn new(
+        max_retries: u32,
+        base_delay: Duration,
+        max_exponent: u32,
+        jitter: Duration,
+    ) -> Self {
+        Self {
+            max_retries,
+            base_delay,
+            max_exponent,
+            jitter,
+        }
+    }
+
+    /// True when another retry is allowed after `attempt` failures.
+    pub(crate) fn can_retry(&self, attempt: u32) -> bool {
+        attempt < self.max_retries
+    }
+
+    /// Exponential backoff delay for a retry attempt, including jitter.
+    pub(crate) fn delay_for_attempt(&self, attempt: u32) -> Duration {
+        let factor = 2u32.saturating_pow(attempt.min(self.max_exponent));
+        let base = self.base_delay.saturating_mul(factor);
+        jittered_delay(base, self.jitter)
+    }
 }
 
 /// Parse a boolean environment variable with a default fallback.

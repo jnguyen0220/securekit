@@ -91,6 +91,9 @@ pub struct WireFinding {
     /// Optional best-effort validity status (`valid`, `invalid`, `unknown`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validity: Option<String>,
+    /// Optional machine-readable reason for the chosen validity status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validity_reason: Option<String>,
 }
 
 /// Client -> server: the result of scanning one work item.
@@ -129,4 +132,27 @@ pub struct StoreStats {
     /// Number of workers currently registered (active shards).
     #[serde(default)]
     pub active_workers: usize,
+    /// Optional rolling latency summaries for key server operations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub perf: Option<PerfStats>,
+}
+
+/// Rolling latency summary in milliseconds.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct LatencyStats {
+    pub samples: usize,
+    pub p50_ms: u64,
+    pub p95_ms: u64,
+    pub max_ms: u64,
+}
+
+/// Optional performance section returned by `GET /stats`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PerfStats {
+    /// `/claim` handler latency over the recent rolling window.
+    pub claim: LatencyStats,
+    /// `/report` handler latency over the recent rolling window.
+    pub report: LatencyStats,
+    /// `/stats` handler latency over the recent rolling window.
+    pub stats: LatencyStats,
 }

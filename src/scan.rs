@@ -19,7 +19,7 @@ use crate::cache::{find_cached_sha, get_repo_commit_sha, ScanCache};
 use crate::report::{Finding, Report};
 use crate::util::{
     fingerprint_secret, github_authenticated_url, redact_url_credentials, u64_from_env,
-    usize_from_env_min,
+    usize_from_env_min, RetryPolicy,
 };
 use crate::validation::validate_secret;
 
@@ -218,14 +218,17 @@ fn scan_repo_dir(
         "png", "jpg", "jpeg", "gif", "pdf", "zip", "gz", "tar", "woff", "woff2", "ico",
     ];
 
-    for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
-        if entry.file_type().is_dir() {
-            let name = entry.file_name().to_string_lossy();
-            if skip_dirs.contains(&name.as_ref()) {
-                continue;
+    for entry in WalkDir::new(path)
+        .into_iter()
+        .filter_entry(|e| {
+            if !e.file_type().is_dir() {
+                return true;
             }
-        }
-
+            let name = e.file_name().to_string_lossy();
+            !skip_dirs.contains(&name.as_ref())
+        })
+        .filter_map(|e| e.ok())
+    {
         if entry.file_type().is_file() {
             let ext = entry
                 .path()
@@ -237,6 +240,8 @@ fn scan_repo_dir(
             }
 
             if let Ok(content) = fs::read_to_string(entry.path()) {
+                let newline_offsets: Vec<usize> =
+                    content.match_indices('\n').map(|(i, _)| i).collect();
                 let rel_path = entry
                     .path()
                     .strip_prefix(path)
@@ -246,7 +251,7 @@ fn scan_repo_dir(
                 for (kind, pattern) in patterns {
                     for m in pattern.find_iter(&content) {
                         let secret = m.as_str().to_string();
-                        let line = content[..m.start()].bytes().filter(|&b| b == b'\n').count() + 1;
+                        let line = line_number_for_byte(&newline_offsets, m.start());
                         findings.push(Finding {
                             kind: (*kind).to_string(),
                             fingerprint: fingerprint_secret(&secret),
@@ -254,6 +259,7 @@ fn scan_repo_dir(
                             file: rel_path.clone(),
                             line,
                             validity: None,
+                            validity_reason: None,
                         });
                     }
                 }
@@ -272,15 +278,16 @@ fn scan_repo_dir(
         }
 
         let batch_size = validate_parallelism();
-        let mut validity_cache: HashMap<String, Option<String>> = HashMap::new();
+        let mut validity_cache: HashMap<String, Option<(String, String)>> = HashMap::new();
 
         for chunk in unique_inputs.chunks(batch_size) {
-            let resolved: Vec<(String, Option<String>)> = chunk
+            let resolved: Vec<(String, Option<(String, String)>)> = chunk
                 .par_iter()
                 .map(|(kind, secret)| {
                     (
                         secret.clone(),
-                        validate_secret(kind, secret, azure_active_probe),
+                        validate_secret(kind, secret, azure_active_probe)
+                            .map(|r| (r.validity, r.reason)),
                     )
                 })
                 .collect();
@@ -291,14 +298,20 @@ fn scan_repo_dir(
         }
 
         for finding in &mut findings {
-            finding.validity = validity_cache
+            let validation = validity_cache
                 .get(&finding.match_text)
                 .cloned()
                 .unwrap_or(None);
+            finding.validity = validation.as_ref().map(|(validity, _)| validity.clone());
+            finding.validity_reason = validation.map(|(_, reason)| reason);
         }
     }
 
     Ok(findings)
+}
+
+fn line_number_for_byte(newline_offsets: &[usize], byte_idx: usize) -> usize {
+    newline_offsets.partition_point(|offset| *offset < byte_idx) + 1
 }
 
 fn clone_error_is_retryable(stderr: &str) -> bool {
@@ -313,8 +326,13 @@ fn clone_error_is_retryable(stderr: &str) -> bool {
         || msg.contains("failure when receiving data from the peer")
 }
 
-fn clone_retry_delay(attempt: u32) -> Duration {
-    Duration::from_secs(2u64.saturating_pow(attempt.min(4)))
+fn clone_retry_policy() -> RetryPolicy {
+    RetryPolicy::new(
+        clone_retries(),
+        Duration::from_secs(2),
+        4,
+        Duration::from_secs(1),
+    )
 }
 
 /// Best-effort cleanup of stale clone dirs from prior runs.
@@ -409,9 +427,9 @@ fn clone_repo(repo_url: &str, token: Option<&str>) -> Result<PathBuf> {
     let clone_url =
         github_authenticated_url(repo_url, token).unwrap_or_else(|| repo_url.to_string());
     let redacted_repo = redact_url_credentials(repo_url);
-    let retries = clone_retries();
+    let retry_policy = clone_retry_policy();
 
-    for attempt in 0..=retries {
+    for attempt in 0..=retry_policy.max_retries {
         let temp_dir = create_unique_clone_dir(repo_name)?;
         let output = Command::new("git")
             .arg("clone")
@@ -430,14 +448,14 @@ fn clone_repo(repo_url: &str, token: Option<&str>) -> Result<PathBuf> {
         let retryable = clone_error_is_retryable(&stderr);
         let _ = fs::remove_dir_all(&temp_dir);
 
-        if retryable && attempt < retries {
-            let delay = clone_retry_delay(attempt);
+        if retryable && retry_policy.can_retry(attempt) {
+            let delay = retry_policy.delay_for_attempt(attempt);
             app::warn(
                 "scan",
                 format!(
                     "git clone retry {}/{} for {}: {}",
                     attempt + 1,
-                    retries,
+                    retry_policy.max_retries,
                     redacted_repo,
                     stderr
                 ),

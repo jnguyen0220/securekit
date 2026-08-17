@@ -9,7 +9,8 @@
 //! implementation can be added later by implementing the same trait — see the
 //! `DB-ready` note in [`crate::server`].
 
-use std::collections::{HashMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
@@ -19,9 +20,13 @@ use std::sync::Mutex;
 use anyhow::{Context, Result};
 use serde::Serialize;
 
+use crate::app;
 use crate::lifecycle::WorkItemLifecycleState;
 use crate::protocol::{StoreStats, SubmitReport, WorkItem};
 use crate::util::current_unix_time;
+
+const RESULTS_FLUSH_EVERY_LINES: usize = 50;
+const RESULTS_FLUSH_MAX_INTERVAL_SECS: u64 = 2;
 
 #[derive(Serialize)]
 struct PersistedFinding {
@@ -32,6 +37,8 @@ struct PersistedFinding {
     fingerprint: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     validity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    validity_reason: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -86,6 +93,7 @@ struct Inflight {
 struct Inner {
     pending: VecDeque<WorkItem>,
     inflight: HashMap<u64, Inflight>,
+    lease_expiry_queue: BinaryHeap<Reverse<(u64, u64)>>,
     item_states: HashMap<u64, WorkItemLifecycleState>,
     done: usize,
     repos_with_leaks: usize,
@@ -104,7 +112,13 @@ struct Inner {
 ///   results survive a restart even though the queue itself does not.
 pub struct FileTargetStore {
     inner: Mutex<Inner>,
-    results_writer: Mutex<BufWriter<fs::File>>,
+    results_writer: Mutex<ResultsWriterState>,
+}
+
+struct ResultsWriterState {
+    writer: BufWriter<fs::File>,
+    dirty_lines: usize,
+    last_flush: u64,
 }
 
 impl FileTargetStore {
@@ -137,10 +151,12 @@ impl FileTargetStore {
             .open(&results_path)
             .with_context(|| format!("failed to open results file: {}", results_path.display()))?;
 
+        let now = current_unix_time();
         Ok(Self {
             inner: Mutex::new(Inner {
                 pending,
                 inflight: HashMap::new(),
+                lease_expiry_queue: BinaryHeap::new(),
                 item_states: (1..next_id)
                     .map(|id| (id, WorkItemLifecycleState::on_enqueue()))
                     .collect(),
@@ -150,7 +166,11 @@ impl FileTargetStore {
                 // A static list is the complete work set from the outset.
                 enumeration_done: true,
             }),
-            results_writer: Mutex::new(BufWriter::new(results_file)),
+            results_writer: Mutex::new(ResultsWriterState {
+                writer: BufWriter::new(results_file),
+                dirty_lines: 0,
+                last_flush: now,
+            }),
         })
     }
 
@@ -163,10 +183,12 @@ impl FileTargetStore {
             .open(&results_path)
             .with_context(|| format!("failed to open results file: {}", results_path.display()))?;
 
+        let now = current_unix_time();
         Ok(Self {
             inner: Mutex::new(Inner {
                 pending: VecDeque::new(),
                 inflight: HashMap::new(),
+                lease_expiry_queue: BinaryHeap::new(),
                 item_states: HashMap::new(),
                 done: 0,
                 repos_with_leaks: 0,
@@ -174,20 +196,35 @@ impl FileTargetStore {
                 // Work arrives asynchronously; not done until the task says so.
                 enumeration_done: false,
             }),
-            results_writer: Mutex::new(BufWriter::new(results_file)),
+            results_writer: Mutex::new(ResultsWriterState {
+                writer: BufWriter::new(results_file),
+                dirty_lines: 0,
+                last_flush: now,
+            }),
         })
     }
 
     /// Move any leases whose deadline has passed back to the pending queue.
     fn requeue_expired(inner: &mut Inner) {
-        let t = current_unix_time();
-        let expired: Vec<u64> = inner
-            .inflight
-            .iter()
-            .filter(|(_, v)| v.lease_expiry <= t)
-            .map(|(k, _)| *k)
-            .collect();
-        for id in expired {
+        let start = std::time::Instant::now();
+        let now = current_unix_time();
+        let mut reclaimed = 0usize;
+
+        while let Some(Reverse((expiry, id))) = inner.lease_expiry_queue.peek().copied() {
+            if expiry > now {
+                break;
+            }
+            inner.lease_expiry_queue.pop();
+
+            // Skip stale heap entries. We only reclaim when the currently
+            // tracked inflight lease for this item still matches the heap key.
+            let Some(inflight) = inner.inflight.get(&id) else {
+                continue;
+            };
+            if inflight.lease_expiry != expiry {
+                continue;
+            }
+
             if let Some(item) = inner.inflight.remove(&id) {
                 let state = inner
                     .item_states
@@ -199,7 +236,19 @@ impl FileTargetStore {
                     repo: item.repo,
                     clone_url: None,
                 });
+                reclaimed += 1;
             }
+        }
+
+        if reclaimed > 0 {
+            app::debug(
+                "store",
+                format!(
+                    "reclaimed {} expired lease(s) in {}ms",
+                    reclaimed,
+                    start.elapsed().as_millis()
+                ),
+            );
         }
     }
 }
@@ -227,6 +276,7 @@ impl TargetStore for FileTargetStore {
                     lease_expiry: expiry,
                 },
             );
+            inner.lease_expiry_queue.push(Reverse((expiry, item.id)));
             leased.push(item);
         }
         leased
@@ -311,15 +361,28 @@ impl TargetStore for FileTargetStore {
                         raw_secret: f.raw_secret,
                         fingerprint: f.fingerprint,
                         validity: f.validity,
+                        validity_reason: f.validity_reason,
                     })
                     .collect(),
                 commit_sha: report.commit_sha,
                 error: report.error,
             };
             let line = serde_json::to_string(&persisted).context("failed to serialize report")?;
-            let mut writer = self.results_writer.lock().unwrap();
-            writeln!(writer, "{}", line).context("failed to write result line")?;
-            writer.flush().context("failed to flush result line")?;
+            let mut state = self.results_writer.lock().unwrap();
+            writeln!(state.writer, "{}", line).context("failed to write result line")?;
+            state.dirty_lines += 1;
+
+            let now = current_unix_time();
+            let should_flush = state.dirty_lines >= RESULTS_FLUSH_EVERY_LINES
+                || now.saturating_sub(state.last_flush) >= RESULTS_FLUSH_MAX_INTERVAL_SECS;
+            if should_flush {
+                state
+                    .writer
+                    .flush()
+                    .context("failed to flush result lines")?;
+                state.dirty_lines = 0;
+                state.last_flush = now;
+            }
         }
         Ok(())
     }
@@ -333,6 +396,20 @@ impl TargetStore for FileTargetStore {
             done: inner.done,
             repos_with_leaks: inner.repos_with_leaks,
             active_workers: 0,
+            perf: None,
+        }
+    }
+}
+
+impl Drop for FileTargetStore {
+    fn drop(&mut self) {
+        let Ok(state) = self.results_writer.get_mut() else {
+            return;
+        };
+        if state.dirty_lines > 0 {
+            let _ = state.writer.flush();
+            state.dirty_lines = 0;
+            state.last_flush = current_unix_time();
         }
     }
 }

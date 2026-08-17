@@ -21,11 +21,17 @@ use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
+#[derive(Clone, Debug)]
+pub(crate) struct ValidationResult {
+    pub(crate) validity: String,
+    pub(crate) reason: String,
+}
+
 pub(crate) fn validate_secret(
     kind: &str,
     secret: &str,
     azure_active_probe: bool,
-) -> Option<String> {
+) -> Option<ValidationResult> {
     let status = match kind {
         "aws_access_key" => validate_aws_access_key(secret),
         "github_token" | "github_oauth" | "github_pat" => validate_github_token(secret),
@@ -47,17 +53,113 @@ pub(crate) fn validate_secret(
         _ => SecretValidity::Unknown,
     };
 
-    Some(match status {
-        SecretValidity::Valid => "valid".to_string(),
-        SecretValidity::Invalid => "invalid".to_string(),
-        SecretValidity::Unknown => "unknown".to_string(),
+    Some(ValidationResult {
+        validity: status.as_str().to_string(),
+        reason: reason_for(kind, status, azure_active_probe).to_string(),
     })
 }
 
+#[derive(Clone, Copy)]
 enum SecretValidity {
     Valid,
     Invalid,
     Unknown,
+}
+
+impl SecretValidity {
+    fn as_str(self) -> &'static str {
+        match self {
+            SecretValidity::Valid => "valid",
+            SecretValidity::Invalid => "invalid",
+            SecretValidity::Unknown => "unknown",
+        }
+    }
+}
+
+fn reason_for(kind: &str, status: SecretValidity, azure_active_probe: bool) -> &'static str {
+    match (kind, status) {
+        ("aws_access_key", SecretValidity::Valid) => "sts_account_match",
+        ("aws_access_key", SecretValidity::Invalid) => "sts_rejected_key_id",
+        ("aws_access_key", SecretValidity::Unknown) => "provider_ambiguous_or_auth_required",
+
+        ("github_token", SecretValidity::Valid)
+        | ("github_oauth", SecretValidity::Valid)
+        | ("github_pat", SecretValidity::Valid) => "github_user_endpoint_ok",
+        ("github_token", SecretValidity::Invalid)
+        | ("github_oauth", SecretValidity::Invalid)
+        | ("github_pat", SecretValidity::Invalid) => "github_unauthorized",
+        ("github_token", SecretValidity::Unknown)
+        | ("github_oauth", SecretValidity::Unknown)
+        | ("github_pat", SecretValidity::Unknown) => "provider_ambiguous_or_network",
+
+        ("slack_token", SecretValidity::Valid) => "slack_auth_test_ok",
+        ("slack_token", SecretValidity::Invalid) => "slack_invalid_or_revoked",
+        ("slack_token", SecretValidity::Unknown) => "provider_ambiguous_or_network",
+
+        ("slack_webhook", SecretValidity::Invalid) => "malformed_slack_webhook_url",
+        ("slack_webhook", SecretValidity::Unknown) => "format_only_validation",
+
+        ("google_api_key", SecretValidity::Invalid) => "malformed_google_api_key",
+        ("google_api_key", SecretValidity::Unknown) => "requires_api_specific_live_probe",
+
+        ("azure_storage_connection_string", SecretValidity::Invalid) => {
+            "malformed_or_failed_shared_key_probe"
+        }
+        ("azure_storage_connection_string", SecretValidity::Valid) => "azure_shared_key_probe_ok",
+        ("azure_storage_connection_string", SecretValidity::Unknown) => {
+            if azure_active_probe {
+                "provider_ambiguous_or_network"
+            } else {
+                "active_probe_disabled"
+            }
+        }
+
+        ("azure_sas_token", SecretValidity::Invalid) => "malformed_or_expired_sas",
+        ("azure_sas_token", SecretValidity::Valid) => "azure_sas_probe_ok",
+        ("azure_sas_token", SecretValidity::Unknown) => {
+            if azure_active_probe {
+                "provider_ambiguous_or_resource_missing"
+            } else {
+                "active_probe_disabled"
+            }
+        }
+
+        ("stripe_secret_key", SecretValidity::Valid)
+        | ("stripe_restricted_key", SecretValidity::Valid) => "stripe_balance_endpoint_ok",
+        ("stripe_secret_key", SecretValidity::Invalid)
+        | ("stripe_restricted_key", SecretValidity::Invalid) => "stripe_unauthorized",
+        ("stripe_secret_key", SecretValidity::Unknown)
+        | ("stripe_restricted_key", SecretValidity::Unknown) => "provider_ambiguous_or_network",
+
+        ("openai_api_key", SecretValidity::Valid) => "openai_models_endpoint_ok",
+        ("openai_api_key", SecretValidity::Invalid) => "openai_unauthorized",
+        ("openai_api_key", SecretValidity::Unknown) => "provider_ambiguous_or_network",
+
+        ("gitlab_pat", SecretValidity::Valid) => "gitlab_user_endpoint_ok",
+        ("gitlab_pat", SecretValidity::Invalid) => "gitlab_unauthorized_or_forbidden",
+        ("gitlab_pat", SecretValidity::Unknown) => "provider_ambiguous_or_network",
+
+        ("npm_token", SecretValidity::Valid) => "npm_whoami_ok",
+        ("npm_token", SecretValidity::Invalid) => "npm_unauthorized",
+        ("npm_token", SecretValidity::Unknown) => "provider_ambiguous_or_network",
+
+        ("sendgrid_api_key", SecretValidity::Valid) => "sendgrid_profile_ok",
+        ("sendgrid_api_key", SecretValidity::Invalid) => "sendgrid_unauthorized_or_forbidden",
+        ("sendgrid_api_key", SecretValidity::Unknown) => "provider_ambiguous_or_network",
+
+        ("twilio_api_key", SecretValidity::Invalid) => "malformed_twilio_api_key",
+        ("twilio_api_key", SecretValidity::Unknown) => "requires_account_sid_and_secret",
+
+        ("private_key", SecretValidity::Invalid) => "malformed_private_key_block",
+        ("private_key", SecretValidity::Unknown) => "format_only_validation",
+
+        ("jwt", SecretValidity::Invalid) => "malformed_or_expired_jwt",
+        ("jwt", SecretValidity::Unknown) => "signature_not_verified",
+
+        (_, SecretValidity::Valid) => "provider_accepted",
+        (_, SecretValidity::Invalid) => "rejected_or_malformed",
+        (_, SecretValidity::Unknown) => "unsupported_or_ambiguous",
+    }
 }
 
 fn http_client() -> Option<Client> {

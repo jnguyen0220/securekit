@@ -12,9 +12,13 @@ use crate::github::enumerate_public_repos_page;
 use crate::github_auth::TokenManager;
 use crate::registry::WorkerRegistry;
 use crate::store::TargetStore;
-use crate::util::read_list_file;
+use crate::util::{jittered_delay, read_list_file};
 
 const ENUM_QUEUE_HIGH_WATER: usize = 5_000;
+const WORKER_WAIT_POLL: Duration = Duration::from_secs(2);
+const QUEUE_WATERMARK_POLL: Duration = Duration::from_secs(2);
+const ENUM_RETRY_BASE_DELAY: Duration = Duration::from_secs(10);
+const ENUM_RETRY_JITTER: Duration = Duration::from_secs(3);
 
 type SharedStore = Arc<dyn TargetStore>;
 
@@ -46,6 +50,10 @@ fn save_enum_cursor_checkpoint(path: &Path, cursor: u64) -> Result<()> {
         serde_json::to_string_pretty(&payload).context("enum cursor serialization failed")?;
     fs::write(path, body)
         .with_context(|| format!("write enum cursor checkpoint {} failed", path.display()))
+}
+
+fn next_enumeration_retry_delay() -> Duration {
+    jittered_delay(ENUM_RETRY_BASE_DELAY, ENUM_RETRY_JITTER)
 }
 
 /// True when `git ls-remote`/HEAD precheck indicates the repository cannot be
@@ -178,7 +186,7 @@ async fn wait_for_active_workers(registry: &WorkerRegistry) {
     if registry.active_count() == 0 {
         app::info("server", "no active workers; background processing paused");
         while registry.active_count() == 0 {
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(WORKER_WAIT_POLL).await;
         }
         app::info("server", "worker connected; background processing resumed");
     }
@@ -229,7 +237,7 @@ where
             loop {
                 wait_for_active_workers(&registry).await;
                 while store.stats().pending >= ENUM_QUEUE_HIGH_WATER {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    tokio::time::sleep(QUEUE_WATERMARK_POLL).await;
                 }
 
                 match enumerate_public_repos_page(&http, cursor, &tokens).await {
@@ -260,11 +268,12 @@ where
                         store.enqueue(filtered);
                     }
                     Err(e) => {
+                        let delay = next_enumeration_retry_delay();
                         app::warn(
                             "server",
-                            format!("enumeration error; retrying in 10s: {}", e),
+                            format!("enumeration error; retrying in {:?}: {}", delay, e),
                         );
-                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        tokio::time::sleep(delay).await;
                     }
                 }
             }

@@ -35,8 +35,11 @@
 //! implementing that trait and constructing it in [`build_store`].
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use axum::{
@@ -48,8 +51,8 @@ use axum::{
 use crate::app;
 use crate::github_auth::TokenManager;
 use crate::protocol::{
-    Ack, ClaimRequest, ClaimResponse, RegisterRequest, StoreStats, SubmitReport, UnregisterRequest,
-    WorkerConfig,
+    Ack, ClaimRequest, ClaimResponse, LatencyStats, PerfStats, RegisterRequest, StoreStats,
+    SubmitReport, UnregisterRequest, WorkerConfig,
 };
 use crate::registry::WorkerRegistry;
 use crate::scan::load_ignore_pattern_strings;
@@ -62,16 +65,14 @@ use crate::server_usecase::{
 };
 use crate::store::{FileTargetStore, TargetStore};
 use crate::util::{bool_from_env, current_unix_time, path_from_env, path_or_default_from_env};
-use crate::{
-    cache::find_cached_sha, cache::load_cache, cache::save_cache, cache::CachedRepo,
-    cache::ScanCache,
-};
+use crate::{cache::load_cache, cache::save_cache, cache::CachedRepo, cache::ScanCache};
 
 /// Hard cap on how many items a single claim can lease, to keep one greedy
 /// client from draining the queue.
 const MAX_CLAIM: usize = 100;
 const CACHE_FLUSH_EVERY_UPDATES: usize = 25;
 const CACHE_FLUSH_MAX_INTERVAL_SECS: u64 = 5;
+const PERF_WINDOW_SIZE: usize = 256;
 
 type SharedStore = Arc<dyn TargetStore>;
 
@@ -83,6 +84,74 @@ struct AppState {
     worker_service: Arc<WorkerLifecycleService>,
     claim_service: Arc<ClaimService>,
     report_service: Arc<ReportService<RepoCache>>,
+    perf: Arc<ServerPerfMonitor>,
+}
+
+#[derive(Default)]
+struct PerfWindow {
+    claim_ms: VecDeque<u64>,
+    report_ms: VecDeque<u64>,
+    stats_ms: VecDeque<u64>,
+}
+
+impl PerfWindow {
+    fn push(queue: &mut VecDeque<u64>, value_ms: u64) {
+        queue.push_back(value_ms);
+        if queue.len() > PERF_WINDOW_SIZE {
+            queue.pop_front();
+        }
+    }
+
+    fn summary(queue: &VecDeque<u64>) -> LatencyStats {
+        if queue.is_empty() {
+            return LatencyStats::default();
+        }
+
+        let mut values: Vec<u64> = queue.iter().copied().collect();
+        values.sort_unstable();
+        let last = values.len() - 1;
+        let p50_idx = (last * 50) / 100;
+        let p95_idx = (last * 95) / 100;
+        let max_ms = *values.last().unwrap_or(&0);
+
+        LatencyStats {
+            samples: values.len(),
+            p50_ms: values[p50_idx],
+            p95_ms: values[p95_idx],
+            max_ms,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ServerPerfMonitor {
+    inner: Mutex<PerfWindow>,
+}
+
+impl ServerPerfMonitor {
+    fn observe_claim(&self, elapsed: Duration) {
+        let mut inner = self.inner.lock().unwrap();
+        PerfWindow::push(&mut inner.claim_ms, elapsed.as_millis() as u64);
+    }
+
+    fn observe_report(&self, elapsed: Duration) {
+        let mut inner = self.inner.lock().unwrap();
+        PerfWindow::push(&mut inner.report_ms, elapsed.as_millis() as u64);
+    }
+
+    fn observe_stats(&self, elapsed: Duration) {
+        let mut inner = self.inner.lock().unwrap();
+        PerfWindow::push(&mut inner.stats_ms, elapsed.as_millis() as u64);
+    }
+
+    fn snapshot(&self) -> PerfStats {
+        let inner = self.inner.lock().unwrap();
+        PerfStats {
+            claim: PerfWindow::summary(&inner.claim_ms),
+            report: PerfWindow::summary(&inner.report_ms),
+            stats: PerfWindow::summary(&inner.stats_ms),
+        }
+    }
 }
 
 /// Server-owned repository cache keyed by repo URL -> last scanned commit SHA.
@@ -92,6 +161,7 @@ struct RepoCache {
 
 struct RepoCacheState {
     cache: ScanCache,
+    by_url: HashMap<String, CachedRepo>,
     dirty_updates: usize,
     last_flush: u64,
 }
@@ -99,9 +169,17 @@ struct RepoCacheState {
 impl RepoCache {
     fn from_disk() -> Result<Self> {
         let now = current_unix_time();
+        let cache = load_cache()?;
+        let by_url = cache
+            .repos
+            .iter()
+            .cloned()
+            .map(|r| (r.url.clone(), r))
+            .collect();
         Ok(Self {
             inner: Mutex::new(RepoCacheState {
-                cache: load_cache()?,
+                cache,
+                by_url,
                 dirty_updates: 0,
                 last_flush: now,
             }),
@@ -110,7 +188,7 @@ impl RepoCache {
 
     fn get_sha(&self, repo: &str) -> Option<String> {
         let state = self.inner.lock().unwrap();
-        find_cached_sha(repo, &state.cache)
+        state.by_url.get(repo).map(|entry| entry.commit_sha.clone())
     }
 
     fn enum_cursor(&self) -> Option<u64> {
@@ -121,6 +199,7 @@ impl RepoCache {
     fn set_enum_cursor(&self, cursor: u64) -> Result<()> {
         let mut state = self.inner.lock().unwrap();
         state.cache.enum_cursor = Some(cursor);
+        Self::sync_cache_from_map(&mut state);
         state.dirty_updates = 0;
         state.last_flush = current_unix_time();
         save_cache(&state.cache)
@@ -128,32 +207,31 @@ impl RepoCache {
 
     fn upsert_sha(&self, repo: &str, sha: &str) -> Result<()> {
         let mut state = self.inner.lock().unwrap();
-        {
-            let cache = &mut state.cache;
-            let mut by_url: HashMap<String, CachedRepo> =
-                cache.repos.drain(..).map(|r| (r.url.clone(), r)).collect();
-            by_url.insert(
-                repo.to_string(),
-                CachedRepo {
-                    url: repo.to_string(),
-                    commit_sha: sha.to_string(),
-                    timestamp: current_unix_time(),
-                },
-            );
-            cache.repos = by_url.into_values().collect();
-            cache.rebuild_index();
-        }
+        state.by_url.insert(
+            repo.to_string(),
+            CachedRepo {
+                url: repo.to_string(),
+                commit_sha: sha.to_string(),
+                timestamp: current_unix_time(),
+            },
+        );
 
         state.dirty_updates += 1;
         let now = current_unix_time();
         let should_flush = state.dirty_updates >= CACHE_FLUSH_EVERY_UPDATES
             || now.saturating_sub(state.last_flush) >= CACHE_FLUSH_MAX_INTERVAL_SECS;
         if should_flush {
+            Self::sync_cache_from_map(&mut state);
             save_cache(&state.cache)?;
             state.dirty_updates = 0;
             state.last_flush = now;
         }
         Ok(())
+    }
+
+    fn sync_cache_from_map(state: &mut RepoCacheState) {
+        state.cache.repos = state.by_url.values().cloned().collect();
+        state.cache.rebuild_index();
     }
 }
 
@@ -179,6 +257,7 @@ impl Drop for RepoCache {
             return;
         };
         if state.dirty_updates > 0 {
+            RepoCache::sync_cache_from_map(state);
             let _ = save_cache(&state.cache);
             state.dirty_updates = 0;
         }
@@ -277,6 +356,7 @@ pub async fn run_server() -> Result<()> {
         worker_service,
         claim_service,
         report_service,
+        perf: Arc::new(ServerPerfMonitor::default()),
     };
 
     let app = Router::new()
@@ -342,16 +422,25 @@ async fn unregister(State(app): State<AppState>, Json(req): Json<UnregisterReque
 }
 
 async fn claim(State(app): State<AppState>, Json(req): Json<ClaimRequest>) -> Json<ClaimResponse> {
-    Json(app.claim_service.claim(&req).await)
+    let started = Instant::now();
+    let response = app.claim_service.claim(&req).await;
+    app.perf.observe_claim(started.elapsed());
+    Json(response)
 }
 
 async fn report(State(app): State<AppState>, Json(report): Json<SubmitReport>) -> Json<Ack> {
-    Json(app.report_service.submit(report))
+    let started = Instant::now();
+    let ack = app.report_service.submit(report);
+    app.perf.observe_report(started.elapsed());
+    Json(ack)
 }
 
 async fn stats(State(app): State<AppState>) -> Json<StoreStats> {
+    let started = Instant::now();
     let mut s = app.store.stats();
     s.active_workers = app.registry.active_count();
+    s.perf = Some(app.perf.snapshot());
+    app.perf.observe_stats(started.elapsed());
     Json(s)
 }
 

@@ -25,6 +25,8 @@ pub(crate) struct Finding {
     pub(crate) line: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) validity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) validity_reason: Option<String>,
 }
 
 /// The result of scanning one repository.
@@ -81,6 +83,7 @@ pub(crate) fn write_output(
                 "fingerprint",
                 "file",
                 "validity",
+                "validity_reason",
             ])?;
             for report in reports {
                 if report.findings.is_empty() {
@@ -88,6 +91,7 @@ pub(crate) fn write_output(
                         report.repo.as_str(),
                         "0",
                         "false",
+                        "",
                         "",
                         "",
                         "",
@@ -105,6 +109,7 @@ pub(crate) fn write_output(
                             finding.fingerprint.as_str(),
                             finding.file.as_str(),
                             finding.validity.as_deref().unwrap_or(""),
+                            finding.validity_reason.as_deref().unwrap_or(""),
                         ])?;
                     }
                 }
@@ -128,10 +133,11 @@ pub(crate) fn write_output(
                 writeln!(writer, "Findings: {}", report.finding_count)?;
                 for finding in &report.findings {
                     let validity = finding.validity.as_deref().unwrap_or("unchecked");
+                    let reason = finding.validity_reason.as_deref().unwrap_or("n/a");
                     writeln!(
                         writer,
-                        "- {} in {} ({}): {}",
-                        finding.kind, finding.file, validity, finding.match_text
+                        "- {} in {} ({}; reason: {}): {}",
+                        finding.kind, finding.file, validity, reason, finding.match_text
                     )?;
                 }
                 writeln!(writer)?;

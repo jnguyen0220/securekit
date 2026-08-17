@@ -71,14 +71,15 @@ pub(crate) async fn write_disclosure_report(
     out.push_str("## How to reach the maintainers\n\n");
     out.push_str(&contact);
     out.push_str("\n\n## Findings (secrets redacted)\n\n");
-    out.push_str("| Type | File | Validity | Redacted value | Fingerprint |\n");
-    out.push_str("|------|------|----------|----------------|-------------|\n");
+    out.push_str("| Type | File | Validity | Reason | Redacted value | Fingerprint |\n");
+    out.push_str("|------|------|----------|--------|----------------|-------------|\n");
     for f in &report.findings {
         out.push_str(&format!(
-            "| {} | {} | {} | `{}` | `{}` |\n",
+            "| {} | {} | {} | {} | `{}` | `{}` |\n",
             f.kind,
             f.file,
             f.validity.as_deref().unwrap_or("unchecked"),
+            f.validity_reason.as_deref().unwrap_or("n/a"),
             redact_secret(&f.match_text),
             f.fingerprint
         ));
