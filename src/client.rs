@@ -222,8 +222,7 @@ fn spawn_heartbeat(
 fn report_concurrency(scan_workers: usize, claim_batch: usize) -> usize {
     scan_workers
         .min(claim_batch)
-        .max(1)
-        .min(MAX_REPORT_CONCURRENCY)
+        .clamp(1, MAX_REPORT_CONCURRENCY)
 }
 
 /// Best-effort unregister call for graceful client shutdown.
