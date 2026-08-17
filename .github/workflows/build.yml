@@ -17,11 +17,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libssl-dev
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -63,12 +58,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Install system dependencies (Linux)
-        if: ${{ runner.os == 'Linux' && !matrix.use_cross }}
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libssl-dev
 
       - name: Install cross
         if: ${{ matrix.use_cross }}
