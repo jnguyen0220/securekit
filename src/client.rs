@@ -1,5 +1,13 @@
 //! Client mode: a zero-credential scanning bot.
 //!
+//! ## Functional core, imperative shell
+//! The interesting decisions — how long to back off, when to exit, how a scan
+//! result becomes a redacted wire report — live in [`crate::client_core`] as
+//! pure, immutable functions. All network I/O is funneled through the single
+//! choke point in [`crate::client_shell`]. This module is the imperative shell:
+//! it owns the runtime (signals, the rayon pool, the heartbeat task) and wires
+//! the pure core to the I/O choke point.
+//!
 //! ## Zero configuration
 //! A client needs nothing but the server URL. On startup it `POST /register`s
 //! and the server replies with a [`WorkerConfig`] — the ignore ruleset, the scan
@@ -11,16 +19,16 @@
 //! a claim queue. The client repeatedly `POST /claim`s a batch of repo URLs,
 //! uses a server-provided clone URL for each lease (authenticated when
 //! available), scans it, and reports back. When the queue is momentarily empty
-//! it backs off and polls
-//! again; when the server signals enumeration is finished and drained, it exits.
-//! A background heartbeat keeps the worker counted as alive.
+//! it backs off and polls again; when the server signals enumeration is finished
+//! and drained, it exits. A background heartbeat keeps the worker counted as
+//! alive.
 //!
 //! ## Secret handling
 //! The raw secret value produced by the scanner never leaves this process. Each
-//! finding is converted into a [`WireFinding`] carrying only the masked value,
-//! a SHA-256 fingerprint, and the file location before being sent upstream.
+//! finding is converted into a [`WireFinding`](crate::protocol::WireFinding)
+//! carrying only the masked value, a SHA-256 fingerprint, and the file location
+//! before being sent upstream.
 
-use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,19 +40,10 @@ use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::app;
-use crate::protocol::{
-    Ack, ClaimRequest, ClaimResponse, RegisterRequest, SubmitReport, UnregisterRequest,
-    WireFinding, WorkerConfig,
-};
+use crate::client_core::{self, ClaimPlan, MIN_IDLE_BACKOFF};
+use crate::client_shell::ServerLink;
+use crate::protocol::{Ack, SubmitReport, WorkerConfig};
 use crate::{compile_ignore_patterns, scan_repo, ScanCache};
-
-/// Shortest and longest backoff while waiting for the server to enumerate more
-/// work into an empty claim queue. The cap is kept modest so a worker that
-/// misses a few empty polls recovers quickly instead of being starved out of
-/// every fresh batch by peers that are polling faster.
-const MIN_IDLE_BACKOFF: Duration = Duration::from_secs(2);
-const MAX_IDLE_BACKOFF: Duration = Duration::from_secs(10);
-const MAX_REPORT_CONCURRENCY: usize = 16;
 
 /// Wait for a process termination signal.
 async fn shutdown_signal() {
@@ -82,13 +81,9 @@ fn spawn_shutdown_listener() -> (watch::Receiver<bool>, Arc<AtomicBool>) {
     (rx, shutdown)
 }
 
-/// Generate a random RFC 4122 version-4 GUID (e.g.
-/// `3f2504e0-4f89-41d3-9a0c-0305e82c3301`) used as the default worker id.
-///
-/// Every client gets a globally-unique id without coordination, so two bots
-/// never collide in the server registry. Entropy is mixed from the clock, pid,
-/// and a stack address and expanded with SplitMix64 — enough to avoid
-/// collisions across a fleet without pulling in a uuid/rand dependency.
+/// Mix entropy from the clock, pid, and a stack address for the GUID seed. This
+/// is the impure half of worker-id generation; the expansion into an RFC 4122
+/// GUID is done by the pure [`client_core::guid_from_seed`].
 fn generate_guid() -> String {
     let seed = {
         let nanos = std::time::SystemTime::now()
@@ -99,39 +94,16 @@ fn generate_guid() -> String {
         let stack_marker = &nanos as *const _ as u64;
         nanos ^ pid.rotate_left(32) ^ stack_marker
     };
-
-    let mut state = seed;
-    let mut next = || {
-        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    };
-
-    let mut bytes = [0u8; 16];
-    bytes[..8].copy_from_slice(&next().to_le_bytes());
-    bytes[8..].copy_from_slice(&next().to_le_bytes());
-    // Stamp the version (4) and RFC 4122 variant bits.
-    bytes[6] = (bytes[6] & 0x0F) | 0x40;
-    bytes[8] = (bytes[8] & 0x3F) | 0x80;
-
-    let mut guid = String::with_capacity(36);
-    for (i, byte) in bytes.iter().enumerate() {
-        if matches!(i, 4 | 6 | 8 | 10) {
-            guid.push('-');
-        }
-        let _ = write!(guid, "{:02x}", byte);
-    }
-    guid
+    client_core::guid_from_seed(seed)
 }
 
-/// Scan a single (public) repository and build the redacted report to send
-/// upstream. Runs on a rayon worker thread, so it must be free of async/`.await`.
-/// The server may provide an authenticated clone URL per lease; the client
-/// itself still manages no GitHub credential.
-struct LocalReport {
-    submit: SubmitReport,
+/// Current wall-clock nanoseconds, used only as jitter entropy for the pure
+/// backoff planner. Differs per process and per call.
+fn entropy_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0)
 }
 
 struct ScanOptions {
@@ -139,7 +111,10 @@ struct ScanOptions {
     azure_active_probe: bool,
 }
 
-fn build_report(
+/// The one side effect in the scan path: clone + scan a repo, then hand the
+/// result to the pure core to build the redacted wire report. Runs on a rayon
+/// worker thread, so it must be free of async/`.await`.
+fn scan_and_build(
     item_id: u64,
     repo: &str,
     clone_url: Option<&str>,
@@ -147,7 +122,7 @@ fn build_report(
     ignore_patterns: &[Regex],
     cache: &ScanCache,
     options: &ScanOptions,
-) -> LocalReport {
+) -> SubmitReport {
     let clone_source = clone_url.unwrap_or(repo);
     match scan_repo(
         repo,
@@ -158,149 +133,26 @@ fn build_report(
         options.validate_secrets,
         options.azure_active_probe,
     ) {
-        Ok(r) => LocalReport {
-            submit: SubmitReport {
-                worker_id: worker_id.to_string(),
-                item_id: Some(item_id),
-                repo: repo.to_string(),
-                has_leak: r.has_leak,
-                finding_count: r.finding_count,
-                // Submit the matched value and full finding metadata.
-                findings: r
-                    .findings
-                    .iter()
-                    .map(|f| WireFinding {
-                        kind: f.kind.clone(),
-                        match_text: f.match_text.clone(),
-                        raw_secret: Some(format!("{}:{}", f.file, f.line)),
-                        fingerprint: f.fingerprint.clone(),
-                        file: f.file.clone(),
-                        validity: f.validity.clone(),
-                        validity_reason: f.validity_reason.clone(),
-                    })
-                    .collect(),
-                commit_sha: r.commit_sha,
-                error: None,
-            },
-        },
-        Err(e) => LocalReport {
-            submit: SubmitReport {
-                worker_id: worker_id.to_string(),
-                item_id: Some(item_id),
-                repo: repo.to_string(),
-                has_leak: false,
-                finding_count: 0,
-                findings: Vec::new(),
-                commit_sha: None,
-                error: Some(e.to_string()),
-            },
-        },
+        Ok(r) => client_core::report_from_scan(item_id, repo, worker_id, &r),
+        Err(e) => client_core::report_from_error(item_id, repo, worker_id, &e.to_string()),
     }
 }
 
-/// Register with the server and return the initial worker config.
-async fn register(http: &reqwest::Client, base: &str, worker_id: &str) -> Result<WorkerConfig> {
-    http.post(format!("{}/register", base))
-        .json(&RegisterRequest {
-            worker_id: worker_id.to_string(),
-        })
-        .send()
-        .await
-        .context("register request failed")?
-        .json()
-        .await
-        .context("register response decode failed")
-}
-
-/// Lease up to `count` repositories from the server's claim queue.
-async fn claim(
-    http: &reqwest::Client,
-    base: &str,
-    worker_id: &str,
-    count: usize,
-) -> Result<ClaimResponse> {
-    http.post(format!("{}/claim", base))
-        .json(&ClaimRequest {
-            worker_id: worker_id.to_string(),
-            count,
-        })
-        .send()
-        .await
-        .context("claim request failed")?
-        .json()
-        .await
-        .context("claim response decode failed")
-}
-
-/// Spawn a background task that heartbeats the server so this worker stays
-/// counted as alive (and its leases keep flowing).
+/// Spawn a background task that heartbeats the server through the I/O choke
+/// point so this worker stays counted as alive (and its leases keep flowing).
 fn spawn_heartbeat(
-    http: reqwest::Client,
-    base: String,
+    link: ServerLink,
     worker_id: String,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(interval).await;
-            if let Err(e) = http
-                .post(format!("{}/heartbeat", base))
-                .json(&RegisterRequest {
-                    worker_id: worker_id.clone(),
-                })
-                .send()
-                .await
-            {
+            if let Err(e) = link.heartbeat(&worker_id).await {
                 app::debug("client", format!("heartbeat failed: {}", e));
             }
         }
     })
-}
-
-fn report_concurrency(scan_workers: usize, claim_batch: usize) -> usize {
-    scan_workers
-        .min(claim_batch)
-        .clamp(1, MAX_REPORT_CONCURRENCY)
-}
-
-/// Pick a randomized wait in `[MIN_IDLE_BACKOFF, cap]` ("full jitter").
-///
-/// Randomizing the idle wait stops the fleet from polling in lock-step, which
-/// otherwise lets a couple of workers repeatedly win every freshly enumerated
-/// batch while others starve. Entropy comes from the wall-clock nanosecond,
-/// which differs per process and per call — good enough to spread polls out.
-fn jittered_backoff(cap: Duration) -> Duration {
-    let min_ms = MIN_IDLE_BACKOFF.as_millis() as u64;
-    let cap_ms = cap.as_millis() as u64;
-    if cap_ms <= min_ms {
-        return cap;
-    }
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u64)
-        .unwrap_or(0);
-    let span = cap_ms - min_ms;
-    Duration::from_millis(min_ms + nanos % (span + 1))
-}
-
-/// Best-effort unregister call for graceful client shutdown.
-async fn unregister(http: &reqwest::Client, base: &str, worker_id: &str) -> Result<()> {
-    let ack: Ack = http
-        .post(format!("{}/unregister", base))
-        .json(&UnregisterRequest {
-            worker_id: worker_id.to_string(),
-        })
-        .send()
-        .await
-        .context("unregister request failed")?
-        .json()
-        .await
-        .context("unregister ack decode failed")?;
-
-    if !ack.ok {
-        anyhow::bail!("unregister rejected by server");
-    }
-    Ok(())
 }
 
 /// Entry point for the `securekit-client` binary.
@@ -309,14 +161,13 @@ async fn unregister(http: &reqwest::Client, base: &str, worker_id: &str) -> Resu
 /// public repo URLs from `/claim`, clones and scans them anonymously in
 /// parallel, and reports redacted results until the server's queue is drained.
 pub async fn run_client(server_url: &str, worker_id: Option<String>) -> Result<()> {
-    let base = server_url.trim_end_matches('/').to_string();
+    let link = ServerLink::new(server_url);
     let worker_id = worker_id.unwrap_or_else(generate_guid);
-    let http = reqwest::Client::new();
     // Client stays stateless: server owns repo cache/filtering decisions.
     let cache = ScanCache::default();
 
     // Join the fleet: the server hands us our scan config (no credential).
-    let config = register(&http, &base, &worker_id).await?;
+    let config: WorkerConfig = link.register(&worker_id).await?;
     let scan_workers = config.scan_workers.max(1);
     let claim_batch = config.claim_batch.max(1);
     let ignore_patterns = compile_ignore_patterns(&config.ignore_patterns)
@@ -337,7 +188,7 @@ pub async fn run_client(server_url: &str, worker_id: Option<String>) -> Result<(
         format!(
             "{} ready at {} (ttl={}s, workers={}, claim_batch={}, ignore_rules={})",
             worker_id,
-            base,
+            link.base(),
             config.ttl_secs,
             scan_workers,
             claim_batch,
@@ -347,7 +198,7 @@ pub async fn run_client(server_url: &str, worker_id: Option<String>) -> Result<(
 
     // Keep the worker alive in the background.
     let hb_interval = Duration::from_secs((config.ttl_secs / 3).max(5));
-    let heartbeat = spawn_heartbeat(http.clone(), base.clone(), worker_id.clone(), hb_interval);
+    let heartbeat = spawn_heartbeat(link.clone(), worker_id.clone(), hb_interval);
     let (mut shutdown_rx, shutdown_flag) = spawn_shutdown_listener();
 
     // Lease → scan → report, until the server's queue is drained.
@@ -365,46 +216,47 @@ pub async fn run_client(server_url: &str, worker_id: Option<String>) -> Result<(
                 terminated_by_signal = true;
                 break;
             }
-            resp = claim(&http, &base, &worker_id, claim_batch) => resp?,
+            resp = link.claim(&worker_id, claim_batch) => resp?,
         };
 
-        if resp.items.is_empty() {
-            if resp.enumeration_done {
+        // Pure core decides the next step; the shell just carries it out.
+        match client_core::plan_claim(&resp, idle_backoff, entropy_nanos()) {
+            ClaimPlan::Drained => {
                 app::info(
                     "client",
                     format!("queue drained; {} scanned {} repo(s)", worker_id, scanned),
                 );
                 break;
             }
-            // Queue momentarily empty; wait for the server to enumerate more.
-            // Use jittered ("full jitter") backoff so the fleet desynchronizes:
-            // without it, whichever workers first win work keep polling on a
-            // short interval and monopolize every fresh batch, starving peers
-            // whose backoff has grown. Jitter gives each worker a fair chance
-            // to be the one polling when new work arrives.
-            let wait = jittered_backoff(idle_backoff);
-            tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    terminated_by_signal = true;
-                    break;
+            ClaimPlan::Idle { wait, next_backoff } => {
+                // Jittered ("full jitter") backoff desynchronizes the fleet:
+                // without it, whichever workers first win work keep polling on a
+                // short interval and monopolize every fresh batch, starving peers
+                // whose backoff has grown.
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        terminated_by_signal = true;
+                        break;
+                    }
+                    _ = tokio::time::sleep(wait) => {}
                 }
-                _ = tokio::time::sleep(wait) => {}
+                idle_backoff = next_backoff;
+                continue;
             }
-            idle_backoff = (idle_backoff * 2).min(MAX_IDLE_BACKOFF);
-            continue;
+            ClaimPlan::Scan => {}
         }
         idle_backoff = MIN_IDLE_BACKOFF;
 
         // Scan leased repos in parallel on the rayon pool.
         let scan_started = std::time::Instant::now();
-        let local_reports: Vec<LocalReport> = pool.install(|| {
+        let reports: Vec<SubmitReport> = pool.install(|| {
             resp.items
                 .par_iter()
                 .filter_map(|item| {
                     if shutdown_flag.load(Ordering::Relaxed) {
                         return None;
                     }
-                    Some(build_report(
+                    Some(scan_and_build(
                         item.id,
                         &item.repo,
                         item.clone_url.as_deref(),
@@ -420,7 +272,7 @@ pub async fn run_client(server_url: &str, worker_id: Option<String>) -> Result<(
             "client",
             format!(
                 "batch scan complete | repos={} | elapsed_ms={}",
-                local_reports.len(),
+                reports.len(),
                 scan_started.elapsed().as_millis()
             ),
         );
@@ -431,66 +283,39 @@ pub async fn run_client(server_url: &str, worker_id: Option<String>) -> Result<(
         }
 
         // Report results with bounded concurrency (async I/O back to the server).
-        let concurrency = report_concurrency(scan_workers, claim_batch);
+        let concurrency = client_core::report_concurrency(scan_workers, claim_batch);
         let limiter = Arc::new(Semaphore::new(concurrency));
         let mut report_tasks: JoinSet<Result<(SubmitReport, Ack)>> = JoinSet::new();
         let report_started = std::time::Instant::now();
 
-        for local in local_reports {
+        for report in reports {
             if shutdown_flag.load(Ordering::Relaxed) {
                 terminated_by_signal = true;
                 break;
             }
 
-            let report = local.submit;
-            let http = http.clone();
-            let base = base.clone();
+            let link = link.clone();
             let limiter = Arc::clone(&limiter);
             report_tasks.spawn(async move {
                 let _permit = limiter
                     .acquire_owned()
                     .await
                     .context("report semaphore acquire failed")?;
-                let ack: Ack = http
-                    .post(format!("{}/report", base))
-                    .json(&report)
-                    .send()
+                let ack = link
+                    .report(&report)
                     .await
-                    .with_context(|| format!("report submit failed for {}", report.repo))?
-                    .json()
-                    .await
-                    .context("report ack decode failed")?;
+                    .with_context(|| format!("report submit failed for {}", report.repo))?;
                 Ok((report, ack))
             });
         }
 
         while let Some(joined) = report_tasks.join_next().await {
-            let result = joined.context("report task join failed")??;
-            let (report, ack) = result;
+            let (report, ack) = joined.context("report task join failed")??;
 
             scanned += 1;
-            let status = app::scan_status(report.error.is_some(), report.has_leak);
-            let error_suffix = report
-                .error
-                .as_deref()
-                .map(app::concise_error)
-                .map(|e| format!(" | reason: {}", e))
-                .unwrap_or_default();
-            let server_suffix = if ack.ok { "" } else { " | server_rejected" };
-            let important = report.has_leak || report.error.is_some() || !ack.ok;
-            app::progress(
-                "client",
-                important,
-                format!(
-                    "{} | repo={} | status={} | findings={}{}{}",
-                    worker_id,
-                    report.repo,
-                    status,
-                    report.finding_count,
-                    server_suffix,
-                    error_suffix
-                ),
-            );
+            let (important, line) =
+                client_core::format_report_progress(&worker_id, &report, ack.ok);
+            app::progress("client", important, line);
         }
         app::debug(
             "client",
@@ -508,7 +333,7 @@ pub async fn run_client(server_url: &str, worker_id: Option<String>) -> Result<(
 
     // Stop heartbeats first so we don't re-register right after unregistering.
     heartbeat.abort();
-    if let Err(e) = unregister(&http, &base, &worker_id).await {
+    if let Err(e) = link.unregister(&worker_id).await {
         app::warn("client", format!("unregister failed: {}", e));
     }
     if terminated_by_signal {

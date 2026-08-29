@@ -44,7 +44,6 @@ impl WorkerLifecycleState {
 pub(crate) enum WorkItemLifecycleState {
     Pending,
     Leased,
-    Completed,
 }
 
 impl WorkItemLifecycleState {
@@ -53,26 +52,10 @@ impl WorkItemLifecycleState {
     }
 
     pub(crate) fn on_claim(self) -> Self {
-        match self {
-            WorkItemLifecycleState::Pending => WorkItemLifecycleState::Leased,
-            WorkItemLifecycleState::Leased => WorkItemLifecycleState::Leased,
-            WorkItemLifecycleState::Completed => WorkItemLifecycleState::Completed,
-        }
+        WorkItemLifecycleState::Leased
     }
 
     pub(crate) fn on_lease_expire(self) -> Self {
-        match self {
-            WorkItemLifecycleState::Leased => WorkItemLifecycleState::Pending,
-            WorkItemLifecycleState::Pending => WorkItemLifecycleState::Pending,
-            WorkItemLifecycleState::Completed => WorkItemLifecycleState::Completed,
-        }
-    }
-
-    pub(crate) fn on_complete(self) -> Self {
-        match self {
-            WorkItemLifecycleState::Pending
-            | WorkItemLifecycleState::Leased
-            | WorkItemLifecycleState::Completed => WorkItemLifecycleState::Completed,
-        }
+        WorkItemLifecycleState::Pending
     }
 }

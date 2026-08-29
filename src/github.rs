@@ -16,6 +16,9 @@ use crate::util::{
 };
 
 const DEFAULT_GITHUB_5XX_RETRIES: u32 = 3;
+const DEFAULT_ENUM_PAGE_DELAY_MS: u64 = 500;
+const SECONDARY_RATE_LIMIT_BASE: Duration = Duration::from_secs(60);
+const MAX_SECONDARY_RETRIES: u32 = 5;
 
 #[derive(Clone)]
 struct CachedPublicRepoPage {
@@ -44,6 +47,32 @@ fn github_5xx_retry_policy() -> RetryPolicy {
         4,
         Duration::from_secs(2),
     )
+}
+
+/// Configurable pause between successive enumeration page fetches, throttling
+/// request rate to stay clear of GitHub's secondary rate limits.
+pub(crate) fn enum_page_delay() -> Duration {
+    Duration::from_millis(u64_from_env(
+        "SECUREKIT_ENUM_PAGE_DELAY_MS",
+        DEFAULT_ENUM_PAGE_DELAY_MS,
+    ))
+}
+
+/// Seconds requested by a `Retry-After` header, if present and numeric.
+fn retry_after_secs(response: &reqwest::Response) -> Option<u64> {
+    response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+/// Bounded, minute-plus backoff for secondary rate limits that arrive without a
+/// `Retry-After`, following GitHub's guidance to wait at least a minute.
+fn secondary_rate_limit_backoff(attempt: u32) -> Duration {
+    let factor = 2u32.saturating_pow(attempt.min(4));
+    let base = SECONDARY_RATE_LIMIT_BASE.saturating_mul(factor);
+    jittered_delay(base, Duration::from_secs(5))
 }
 
 fn cached_public_repo_page(cursor: u64) -> Option<CachedPublicRepoPage> {
@@ -149,6 +178,7 @@ async fn fetch_public_repos_page(
     let cached = cached_public_repo_page(cursor);
     let retry_policy = github_5xx_retry_policy();
     let mut failures = 0u32;
+    let mut secondary_failures = 0u32;
 
     loop {
         let if_none_match = cached.as_ref().map(|entry| entry.etag.as_str());
@@ -166,6 +196,18 @@ async fn fetch_public_repos_page(
 
         // Rate-limit handling: back off when exhausted, then retry.
         if response.status().as_u16() == 403 || response.status().as_u16() == 429 {
+            // Secondary (abuse) limits ask us to wait via Retry-After; honor it
+            // even when the primary quota still shows requests remaining.
+            if let Some(retry_after) = retry_after_secs(&response) {
+                let wait = retry_after.clamp(1, 3600);
+                app::warn(
+                    "github",
+                    format!("secondary rate limit; retry-after {}s", wait),
+                );
+                tokio::time::sleep(Duration::from_secs(wait)).await;
+                continue;
+            }
+
             let remaining = response
                 .headers()
                 .get("x-ratelimit-remaining")
@@ -184,7 +226,26 @@ async fn fetch_public_repos_page(
                 tokio::time::sleep(Duration::from_secs(wait)).await;
                 continue;
             }
-            anyhow::bail!("GitHub API returned {}", response.status());
+
+            // Secondary limit without Retry-After: wait a minute-plus (bounded)
+            // before retrying rather than failing the whole enumeration.
+            if secondary_failures < MAX_SECONDARY_RETRIES {
+                let delay = secondary_rate_limit_backoff(secondary_failures);
+                app::warn(
+                    "github",
+                    format!(
+                        "secondary rate limit on cursor {}; backing off {:?}",
+                        cursor, delay
+                    ),
+                );
+                secondary_failures += 1;
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            anyhow::bail!(
+                "GitHub API returned {} (secondary rate limit)",
+                response.status()
+            );
         }
 
         if response.status().is_server_error() {
@@ -327,6 +388,8 @@ pub(crate) async fn enumerate_public_repos(
             break;
         }
         cursor = max_id;
+        // Throttle request rate to stay under GitHub's rate limits.
+        tokio::time::sleep(enum_page_delay()).await;
     }
 
     app::info("github", format!("collected {} repos", collected.len()));

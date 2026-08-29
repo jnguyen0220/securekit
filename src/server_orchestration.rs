@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::app;
-use crate::github::enumerate_public_repos_page;
+use crate::github::{enum_page_delay, enumerate_public_repos_page};
 use crate::github_auth::TokenManager;
 use crate::registry::WorkerRegistry;
 use crate::store::TargetStore;
@@ -223,6 +223,8 @@ where
                             git_head_timeout_secs,
                         );
                         store.enqueue(filtered);
+                        // Throttle request rate to stay under GitHub's rate limits.
+                        tokio::time::sleep(enum_page_delay()).await;
                     }
                     Err(e) => {
                         let delay = next_enumeration_retry_delay();

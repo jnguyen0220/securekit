@@ -4,6 +4,9 @@
 
 set -e
 
+# Run from the repo root regardless of where this script is invoked from.
+cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
+
 echo "Building the secret repository scanner..."
 cargo build --release
 

@@ -4,12 +4,11 @@ use anyhow::Result;
 
 use crate::app;
 use crate::github_auth::TokenManager;
-use crate::protocol::{Ack, ClaimRequest, ClaimResponse, SubmitReport, WorkerConfig};
+use crate::protocol::{Ack, ClaimResponse, SubmitReport, WorkerConfig};
 use crate::registry::WorkerRegistry;
+use crate::server_core;
 use crate::store::TargetStore;
 use crate::util::github_authenticated_url;
-
-const MAX_CLAIM: usize = 100;
 
 type SharedStore = Arc<dyn TargetStore>;
 
@@ -81,10 +80,12 @@ impl ClaimService {
         }
     }
 
-    pub(crate) async fn claim(&self, req: &ClaimRequest) -> ClaimResponse {
+    pub(crate) async fn claim(&self) -> ClaimResponse {
         let stats = self.store.stats();
         let active_workers = self.registry.active_count();
-        let count = fair_claim_count(req.count, stats.pending, active_workers);
+        // Hand this bot an even round-robin slice of the pending queue based on
+        // how many bots are currently connected.
+        let count = server_core::round_robin_claim_count(stats.pending, active_workers);
         let mut items = self.store.claim(count, self.lease_secs);
         let token = self.token_manager.token().await;
         for item in &mut items {
@@ -121,34 +122,14 @@ where
     }
 
     pub(crate) fn submit(&self, report: SubmitReport) -> Ack {
-        let worker_id = report.worker_id.clone();
+        // Pure core builds the operator-facing log line; the shell owns the I/O.
+        let (important, progress_line) = server_core::format_report_progress(&report);
         let repo = report.repo.clone();
         let sha = report.commit_sha.clone();
-        let finding_count = report.finding_count;
-        let has_leak = report.has_leak;
-        let reason = report
-            .error
-            .as_deref()
-            .map(app::concise_error)
-            .map(|e| format!(" | reason: {}", e))
-            .unwrap_or_default();
-        let status = if report.error.is_some() {
-            "skip"
-        } else {
-            "scan"
-        };
 
         match self.store.complete(report) {
             Ok(()) => {
-                let important = has_leak || status == "skip";
-                app::progress(
-                    "server",
-                    important,
-                    format!(
-                        "{} | repo={} | status={} | findings={}{}",
-                        worker_id, repo, status, finding_count, reason
-                    ),
-                );
+                app::progress("server", important, progress_line);
                 if let Some(commit_sha) = sha {
                     if let Err(e) = self.cache.upsert_sha(&repo, &commit_sha) {
                         app::warn(
@@ -165,15 +146,6 @@ where
             }
         }
     }
-}
-
-/// Compute a fair per-request claim size so one worker cannot monopolize the
-/// queue when multiple workers are active.
-pub(crate) fn fair_claim_count(requested: usize, pending: usize, active_workers: usize) -> usize {
-    let requested = requested.clamp(1, MAX_CLAIM);
-    let workers = active_workers.max(1);
-    let fair_share = pending.max(1).div_ceil(workers).max(1);
-    requested.min(fair_share)
 }
 
 #[cfg(test)]
@@ -296,12 +268,7 @@ mod tests {
             let token_manager = Arc::new(TokenManager::from_env().await);
             let service = ClaimService::new(store, registry, token_manager, 30);
 
-            let resp = service
-                .claim(&ClaimRequest {
-                    worker_id: "w1".to_string(),
-                    count: 1,
-                })
-                .await;
+            let resp = service.claim().await;
 
             assert_eq!(resp.items.len(), 1);
             assert!(!resp.enumeration_done);
@@ -318,12 +285,7 @@ mod tests {
             let token_manager = Arc::new(TokenManager::from_env().await);
             let service = ClaimService::new(store, registry, token_manager, 30);
 
-            let resp = service
-                .claim(&ClaimRequest {
-                    worker_id: "w1".to_string(),
-                    count: 5,
-                })
-                .await;
+            let resp = service.claim().await;
 
             assert!(resp.items.is_empty());
             assert!(resp.enumeration_done);

@@ -8,11 +8,14 @@
 
 // Distributed server/client mode.
 pub mod client;
+mod client_core;
+mod client_shell;
 pub mod github_auth;
 pub mod protocol;
 pub mod registry;
 pub mod server;
 mod server_config;
+mod server_core;
 mod server_orchestration;
 mod server_usecase;
 pub mod store;

@@ -19,13 +19,16 @@
 # Run several of these in parallel (with distinct worker ids) to scan faster.
 #
 # Usage:
-#   ./start-client.sh [SERVER_URL] [WORKER_ID]
+#   ./scripts/start-client.sh [SERVER_URL] [WORKER_ID]
 #
 # Examples:
-#   ./start-client.sh                                   # defaults below
-#   ./start-client.sh http://127.0.0.1:8080 bot-1
+#   ./scripts/start-client.sh                                   # defaults below
+#   ./scripts/start-client.sh http://127.0.0.1:8080 bot-1
 
 set -euo pipefail
+
+# Run from the repo root regardless of where this script is invoked from.
+cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 
 # ---- Configuration ----------------------------------------------------------
 SERVER_URL="${1:-${SERVER_URL:-http://127.0.0.1:8080}}"

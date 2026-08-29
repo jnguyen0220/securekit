@@ -40,7 +40,7 @@ for you.
 
 ```bash
 # Passes any arguments straight through to the binary.
-./start.sh --repo-file repos.txt --output json
+./scripts/start.sh --repo-file repos.txt --output json
 ```
 
 ### Distributed public-repo crawl
@@ -54,7 +54,7 @@ public repositories from GitHub and hands them out; one or more **clients**
    shared target list (`repos.txt`), then serves them:
 
    ```bash
-   ./start-server.sh
+   ./scripts/start-server.sh
    ```
 
    Tune the enumeration with environment variables:
@@ -63,7 +63,7 @@ public repositories from GitHub and hands them out; one or more **clients**
    SECUREKIT_ENUM_COUNT=5000 \   # how many public repos to enumerate
    SECUREKIT_SINCE=1000000 \     # start after this numeric repo id (cursor)
    SECUREKIT_FORCE_ENUM=1 \      # rebuild the list even if one exists
-   ./start-server.sh
+   ./scripts/start-server.sh
    ```
 
    Provide a `GITHUB_TOKEN` (in the environment or `.env`) for real
@@ -74,14 +74,14 @@ public repositories from GitHub and hands them out; one or more **clients**
    bot at a time:
 
    ```bash
-   ./start-client.sh http://127.0.0.1:8080 bot-1
-   ./start-client.sh http://127.0.0.1:8080 bot-2   # optional, run in parallel
+   ./scripts/start-client.sh http://127.0.0.1:8080 bot-1
+   ./scripts/start-client.sh http://127.0.0.1:8080 bot-2   # optional, run in parallel
    ```
 
    Adjust the claim batch size via the environment:
 
    ```bash
-   CLAIM_BATCH=8 ./start-client.sh http://127.0.0.1:8080 bot-1
+   CLAIM_BATCH=8 ./scripts/start-client.sh http://127.0.0.1:8080 bot-1
    ```
 
 Redacted findings are appended to `results.jsonl` (`SECUREKIT_RESULTS_FILE`).
@@ -241,8 +241,8 @@ collects results, and any number of **clients** that scan locally and report
 back **only redacted** findings (raw secrets never leave the client machine).
 
 The quickest path is the helper scripts described in
-[Quick start](#quick-start-helper-scripts): `./start-server.sh` enumerates
-public repositories and serves them, and `./start-client.sh` runs a scanning
+[Quick start](#quick-start-helper-scripts): `./scripts/start-server.sh` enumerates
+public repositories and serves them, and `./scripts/start-client.sh` runs a scanning
 bot. The steps below show the equivalent raw commands.
 
 Start the server (reads its target list and bind address from `.env`):

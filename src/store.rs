@@ -325,11 +325,10 @@ impl TargetStore for FileTargetStore {
                 Some(id) => {
                     let was_inflight = inner.inflight.remove(&id).is_some();
                     if was_inflight {
-                        let state = inner
-                            .item_states
-                            .entry(id)
-                            .or_insert(WorkItemLifecycleState::on_enqueue());
-                        *state = state.on_complete();
+                        // Terminal state: evict the lifecycle record so this map
+                        // stays bounded to live work instead of growing by one
+                        // entry per item for the whole run.
+                        inner.item_states.remove(&id);
                     }
                     was_inflight
                 }

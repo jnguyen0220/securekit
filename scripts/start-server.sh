@@ -8,13 +8,13 @@
 # read from the environment; this script provides sensible defaults.
 #
 # Usage:
-#   ./start-server.sh
+#   ./scripts/start-server.sh
 #
 # Override any setting via the environment, e.g.:
-#   SECUREKIT_BIND=0.0.0.0:9000 ./start-server.sh
-#   SECUREKIT_ENUM_SINCE=1000000 ./start-server.sh       # start after this repo id
-#   SECUREKIT_CLAIM_BATCH=25 ./start-server.sh           # repos leased per claim
-#   SECUREKIT_LIST_FILE=repos.txt ./start-server.sh      # scan a static list instead
+#   SECUREKIT_BIND=0.0.0.0:9000 ./scripts/start-server.sh
+#   SECUREKIT_ENUM_SINCE=1000000 ./scripts/start-server.sh       # start after this repo id
+#   SECUREKIT_CLAIM_BATCH=25 ./scripts/start-server.sh           # repos leased per claim
+#   SECUREKIT_LIST_FILE=repos.txt ./scripts/start-server.sh      # scan a static list instead
 #
 # The server authenticates enumeration with a GitHub App (GITHUB_APP_ID +
 # GITHUB_APP_INSTALLATION_ID + private key) or a personal token (GITHUB_TOKEN),
@@ -22,6 +22,9 @@
 # to 60 requests/hour, so a credential is strongly recommended.
 
 set -euo pipefail
+
+# Run from the repo root regardless of where this script is invoked from.
+cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 
 # ---- Configuration (override via environment) -------------------------------
 export SECUREKIT_BIND="${SECUREKIT_BIND:-127.0.0.1:8080}"

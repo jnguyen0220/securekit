@@ -10,11 +10,11 @@
 # leave the bot.
 #
 # Usage:
-#   ./start-fleet.sh [N_WORKERS]
+#   ./scripts/start-fleet.sh [N_WORKERS]
 #
 # Examples:
-#   ./start-fleet.sh            # 5 workers (default)
-#   ./start-fleet.sh 10         # 10 workers
+#   ./scripts/start-fleet.sh            # 5 workers (default)
+#   ./scripts/start-fleet.sh 10         # 10 workers
 #
 # Environment overrides:
 #   SECUREKIT_BIND=127.0.0.1:8080   server bind address
@@ -23,6 +23,9 @@
 #   LOG_DIR=/tmp/securekit-fleet    where per-process logs are written
 
 set -euo pipefail
+
+# Run from the repo root regardless of where this script is invoked from.
+cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 
 # ---- Configuration ----------------------------------------------------------
 N_WORKERS="${1:-5}"

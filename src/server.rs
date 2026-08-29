@@ -12,9 +12,10 @@
 //! | `SECUREKIT_LEASE_SECS`    | How long a claimed item stays leased      | `300`                |
 //! | `SECUREKIT_WORKER_TTL_SECS` | Heartbeat window before a worker expires | `60`                |
 //! | `SECUREKIT_SCAN_WORKERS`  | Parallel scans the server tells clients to run | `4`             |
-//! | `SECUREKIT_CLAIM_BATCH`   | Repos a client leases per `/claim`        | `10`                 |
+//! | `SECUREKIT_CLAIM_BATCH`   | Advisory client batch hint (server allocates a round-robin slice per bot) | `10` |
 //! | `SECUREKIT_ENUM_SINCE`    | Numeric repo id to start enumeration after | `0`                 |
 //! | `SECUREKIT_ENUM_CURSOR_FILE` | Where to persist enumeration cursor | `.enum-cursor.json` |
+//! | `SECUREKIT_ENUM_PAGE_DELAY_MS` | Pause between GitHub enumeration page fetches (rate-limit throttle) | `500` |
 //! | `SECUREKIT_IGNORE_FILE`   | Ignore-regex file shipped to clients      | optional             |
 //! | `SECUREKIT_NO_DEFAULT_IGNORES` | Drop the built-in false-positive rules | `false`             |
 //! | `GITHUB_APP_*` / `GITHUB_TOKEN` | GitHub credential the **server** enumerates with | anonymous |
@@ -421,9 +422,11 @@ async fn unregister(State(app): State<AppState>, Json(req): Json<UnregisterReque
     Json(ack)
 }
 
-async fn claim(State(app): State<AppState>, Json(req): Json<ClaimRequest>) -> Json<ClaimResponse> {
+async fn claim(State(app): State<AppState>, Json(_req): Json<ClaimRequest>) -> Json<ClaimResponse> {
     let started = Instant::now();
-    let response = app.claim_service.claim(&req).await;
+    // The server drives allocation: it hands this bot an even round-robin slice
+    // of the pending queue, so the client's requested batch size is advisory.
+    let response = app.claim_service.claim().await;
     app.perf.observe_claim(started.elapsed());
     Json(response)
 }
@@ -447,18 +450,21 @@ async fn stats(State(app): State<AppState>) -> Json<StoreStats> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server_usecase::fair_claim_count;
+    use crate::server_core::round_robin_claim_count;
 
     #[test]
-    fn fair_claim_splits_pending_across_workers() {
-        assert_eq!(fair_claim_count(10, 9, 2), 5);
-        assert_eq!(fair_claim_count(10, 20, 2), 10);
-        assert_eq!(fair_claim_count(10, 3, 3), 1);
+    fn round_robin_splits_pending_evenly_across_bots() {
+        // 100 urls across 5 connected bots -> 20 each, mutually exclusive.
+        assert_eq!(round_robin_claim_count(100, 5), 20);
+        // Uneven splits round up so no item is stranded.
+        assert_eq!(round_robin_claim_count(9, 2), 5);
+        assert_eq!(round_robin_claim_count(3, 3), 1);
     }
 
     #[test]
-    fn fair_claim_handles_bounds_and_empty_inputs() {
-        assert_eq!(fair_claim_count(0, 0, 0), 1);
-        assert_eq!(fair_claim_count(MAX_CLAIM + 50, 10_000, 1), MAX_CLAIM);
+    fn round_robin_handles_bounds_and_empty_inputs() {
+        assert_eq!(round_robin_claim_count(0, 0), 1);
+        // A lone bot still can't drain more than MAX_CLAIM in one claim.
+        assert_eq!(round_robin_claim_count(10_000, 1), MAX_CLAIM);
     }
 }
