@@ -710,7 +710,7 @@ fn b64url_decode(input: &str) -> Option<Vec<u8>> {
         return None;
     }
 
-    for chunk in bytes.chunks_exact(4) {
+    for chunk in bytes.as_chunks::<4>().0 {
         let a = b64_val(chunk[0])?;
         let b = b64_val(chunk[1])?;
         let c = if chunk[2] == b'=' {
