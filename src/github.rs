@@ -12,13 +12,21 @@ use serde::Deserialize;
 use crate::app;
 use crate::github_auth::TokenManager;
 use crate::util::{
-    current_unix_time, github_user_agent, jittered_delay, u64_from_env, RetryPolicy,
+    current_unix_time, github_user_agent, jittered_delay, parse_rfc3339_to_unix, u64_from_env,
+    RetryPolicy,
 };
 
 const DEFAULT_GITHUB_5XX_RETRIES: u32 = 3;
 const DEFAULT_ENUM_PAGE_DELAY_MS: u64 = 500;
 const SECONDARY_RATE_LIMIT_BASE: Duration = Duration::from_secs(60);
 const MAX_SECONDARY_RETRIES: u32 = 5;
+/// Repos whose last push is older than this many years are skipped during
+/// enumeration. Override via `SECUREKIT_MAX_REPO_AGE_YEARS`.
+const DEFAULT_MAX_REPO_AGE_YEARS: u64 = 5;
+/// Seconds in an average year (365.25 days), used to derive the age cutoff.
+const SECS_PER_YEAR: u64 = 31_557_600;
+/// GitHub GraphQL endpoint, used to batch-resolve repo push dates.
+const GITHUB_GRAPHQL_URL: &str = "https://api.github.com/graphql";
 
 #[derive(Clone)]
 struct CachedPublicRepoPage {
@@ -89,9 +97,17 @@ fn cache_public_repo_page(cursor: u64, etag: String, page: Vec<GitHubRepo>) {
 struct GitHubRepo {
     #[serde(default)]
     id: u64,
+    /// GraphQL global node id, used to batch-fetch `pushedAt` in one request.
+    node_id: Option<String>,
     clone_url: Option<String>,
     html_url: Option<String>,
     full_name: Option<String>,
+    /// Per-repo GitHub API URL (present on list responses); used to fetch
+    /// details such as `pushed_at` that the list endpoint omits.
+    url: Option<String>,
+    /// Last push timestamp (RFC 3339). Absent from the list endpoint, present
+    /// on the single-repo detail endpoint.
+    pushed_at: Option<String>,
 }
 
 impl GitHubRepo {
@@ -162,36 +178,33 @@ async fn send_public_repo_request(
     Ok(response)
 }
 
-/// Fetch a single page (up to 100) of public repos from GitHub's documented
-/// "List public repositories" endpoint (`GET /repositories?since=`), starting
-/// after `cursor`. Transparently refreshes an expired/revoked token and backs
-/// off (sleeping) when the rate limit is exhausted. Returns the raw page.
-async fn fetch_public_repos_page(
+/// Outcome of a GitHub GET that has already passed rate-limit/5xx handling.
+enum GithubGet {
+    /// Server returned 304 Not Modified (only possible when an ETag was sent).
+    NotModified,
+    /// A successful (2xx) response ready to be decoded.
+    Success(reqwest::Response),
+}
+
+/// Issue a GET against the GitHub API, transparently handling token refresh,
+/// primary/secondary rate limits (with backoff), and 5xx retries. `label` is
+/// used only for log context. Returns once a terminal outcome is reached.
+async fn github_get_with_backoff(
     client: &reqwest::Client,
-    cursor: u64,
+    url: &str,
     token_manager: &TokenManager,
-) -> Result<Vec<GitHubRepo>> {
-    let url = format!(
-        "https://api.github.com/repositories?since={}&per_page=100",
-        cursor
-    );
-    let cached = cached_public_repo_page(cursor);
+    if_none_match: Option<&str>,
+    label: &str,
+) -> Result<GithubGet> {
     let retry_policy = github_5xx_retry_policy();
     let mut failures = 0u32;
     let mut secondary_failures = 0u32;
 
     loop {
-        let if_none_match = cached.as_ref().map(|entry| entry.etag.as_str());
-        let response = send_public_repo_request(client, &url, token_manager, if_none_match).await?;
+        let response = send_public_repo_request(client, url, token_manager, if_none_match).await?;
 
-        // Reuse cached content when the page has not changed.
         if response.status().as_u16() == 304 {
-            if let Some(entry) = cached.as_ref() {
-                return Ok(entry.page.clone());
-            }
-            let delay = jittered_delay(Duration::from_secs(1), Duration::from_secs(1));
-            tokio::time::sleep(delay).await;
-            continue;
+            return Ok(GithubGet::NotModified);
         }
 
         // Rate-limit handling: back off when exhausted, then retry.
@@ -233,10 +246,7 @@ async fn fetch_public_repos_page(
                 let delay = secondary_rate_limit_backoff(secondary_failures);
                 app::warn(
                     "github",
-                    format!(
-                        "secondary rate limit on cursor {}; backing off {:?}",
-                        cursor, delay
-                    ),
+                    format!("secondary rate limit on {}; backing off {:?}", label, delay),
                 );
                 secondary_failures += 1;
                 tokio::time::sleep(delay).await;
@@ -254,9 +264,9 @@ async fn fetch_public_repos_page(
                 app::warn(
                     "github",
                     format!(
-                        "GitHub API {} on cursor {}; retrying in {:?}",
+                        "GitHub API {} on {}; retrying in {:?}",
                         response.status(),
-                        cursor,
+                        label,
                         delay
                     ),
                 );
@@ -271,22 +281,209 @@ async fn fetch_public_repos_page(
             anyhow::bail!("GitHub API returned {}", response.status());
         }
 
-        let etag = response
-            .headers()
-            .get("etag")
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.to_string());
-        let page: Vec<GitHubRepo> = response
-            .json()
-            .await
-            .context("GitHub API response decode failed")?;
-
-        if let Some(etag) = etag {
-            cache_public_repo_page(cursor, etag, page.clone());
-        }
-
-        return Ok(page);
+        return Ok(GithubGet::Success(response));
     }
+}
+
+/// Fetch a single page (up to 100) of public repos from GitHub's documented
+/// "List public repositories" endpoint (`GET /repositories?since=`), starting
+/// after `cursor`. Transparently refreshes an expired/revoked token and backs
+/// off (sleeping) when the rate limit is exhausted. Returns the raw page.
+async fn fetch_public_repos_page(
+    client: &reqwest::Client,
+    cursor: u64,
+    token_manager: &TokenManager,
+) -> Result<Vec<GitHubRepo>> {
+    let url = format!(
+        "https://api.github.com/repositories?since={}&per_page=100",
+        cursor
+    );
+    let cached = cached_public_repo_page(cursor);
+    let label = format!("cursor {}", cursor);
+
+    loop {
+        let if_none_match = cached.as_ref().map(|entry| entry.etag.as_str());
+        match github_get_with_backoff(client, &url, token_manager, if_none_match, &label).await? {
+            // Reuse cached content when the page has not changed.
+            GithubGet::NotModified => {
+                if let Some(entry) = cached.as_ref() {
+                    return Ok(entry.page.clone());
+                }
+                let delay = jittered_delay(Duration::from_secs(1), Duration::from_secs(1));
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            GithubGet::Success(response) => {
+                let etag = response
+                    .headers()
+                    .get("etag")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| v.to_string());
+                let page: Vec<GitHubRepo> = response
+                    .json()
+                    .await
+                    .context("GitHub API response decode failed")?;
+
+                if let Some(etag) = etag {
+                    cache_public_repo_page(cursor, etag, page.clone());
+                }
+
+                return Ok(page);
+            }
+        }
+    }
+}
+
+/// Configured maximum repository age (by last push), in years.
+fn max_repo_age_years() -> u64 {
+    u64_from_env("SECUREKIT_MAX_REPO_AGE_YEARS", DEFAULT_MAX_REPO_AGE_YEARS)
+}
+
+/// Earliest acceptable `pushed_at` (unix seconds): repos pushed before this are
+/// considered too old to process.
+fn recent_push_cutoff() -> u64 {
+    current_unix_time().saturating_sub(max_repo_age_years().saturating_mul(SECS_PER_YEAR))
+}
+
+/// Resolve a repo's last-push time (unix seconds). The list endpoint omits
+/// `pushed_at`, so fall back to a single-repo detail fetch via its API `url`.
+async fn fetch_repo_pushed_at(
+    client: &reqwest::Client,
+    repo: &GitHubRepo,
+    token_manager: &TokenManager,
+) -> Result<Option<u64>> {
+    if let Some(ts) = repo.pushed_at.as_deref().and_then(parse_rfc3339_to_unix) {
+        return Ok(Some(ts));
+    }
+    let Some(url) = repo.url.as_deref() else {
+        return Ok(None);
+    };
+    let label = repo.full_name.as_deref().unwrap_or(url);
+    match github_get_with_backoff(client, url, token_manager, None, label).await? {
+        GithubGet::NotModified => Ok(None),
+        GithubGet::Success(response) => {
+            let detail: GitHubRepo = response
+                .json()
+                .await
+                .context("GitHub repo detail decode failed")?;
+            Ok(detail.pushed_at.as_deref().and_then(parse_rfc3339_to_unix))
+        }
+    }
+}
+
+/// Whether a repo was pushed within the configured age window. Repos whose push
+/// time cannot be determined (missing data or a transient error) are kept, so a
+/// hiccup never silently drops potentially-recent repos.
+async fn repo_pushed_recently(
+    client: &reqwest::Client,
+    repo: &GitHubRepo,
+    cutoff: u64,
+    token_manager: &TokenManager,
+) -> bool {
+    match fetch_repo_pushed_at(client, repo, token_manager).await {
+        Ok(Some(ts)) => ts >= cutoff,
+        Ok(None) => true,
+        Err(e) => {
+            app::warn(
+                "github",
+                format!(
+                    "could not determine push date for {}; keeping it ({})",
+                    repo.full_name.as_deref().unwrap_or("<unknown>"),
+                    e
+                ),
+            );
+            true
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct GraphQlPushResponse {
+    data: Option<GraphQlPushData>,
+}
+
+#[derive(Deserialize)]
+struct GraphQlPushData {
+    nodes: Vec<Option<GraphQlRepoNode>>,
+}
+
+#[derive(Deserialize)]
+struct GraphQlRepoNode {
+    id: String,
+    #[serde(rename = "pushedAt")]
+    pushed_at: Option<String>,
+}
+
+/// Resolve last-push times (unix seconds) for a whole page of repos in a single
+/// GraphQL request, keyed by GitHub node id. This replaces up to 100 per-repo
+/// REST detail calls with one cheap query. Returns an empty map when no token is
+/// available (GraphQL rejects anonymous requests) or the request fails, so
+/// callers transparently fall back to the per-repo REST path.
+async fn batch_pushed_at(
+    client: &reqwest::Client,
+    repos: &[GitHubRepo],
+    token_manager: &TokenManager,
+) -> HashMap<String, u64> {
+    let mut out = HashMap::new();
+    let ids: Vec<&str> = repos.iter().filter_map(|r| r.node_id.as_deref()).collect();
+    if ids.is_empty() {
+        return out;
+    }
+    let token = token_manager.token().await;
+    if token.is_none() {
+        return out; // GraphQL requires authentication.
+    }
+
+    let query = "query($ids:[ID!]!){nodes(ids:$ids){... on Repository{id pushedAt}}}";
+    let body = serde_json::json!({ "query": query, "variables": { "ids": ids } });
+    let request = github_headers(client.post(GITHUB_GRAPHQL_URL), &token).json(&body);
+
+    let response = match request.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            app::warn("github", format!("GraphQL push-date query failed: {}", e));
+            return out;
+        }
+    };
+    if !response.status().is_success() {
+        app::warn(
+            "github",
+            format!("GraphQL push-date query returned {}", response.status()),
+        );
+        return out;
+    }
+    let parsed: GraphQlPushResponse = match response.json().await {
+        Ok(p) => p,
+        Err(e) => {
+            app::warn("github", format!("GraphQL push-date decode failed: {}", e));
+            return out;
+        }
+    };
+    let Some(data) = parsed.data else {
+        return out;
+    };
+    for node in data.nodes.into_iter().flatten() {
+        if let Some(ts) = node.pushed_at.as_deref().and_then(parse_rfc3339_to_unix) {
+            out.insert(node.id, ts);
+        }
+    }
+    out
+}
+
+/// Whether a repo was pushed within the age window, preferring the batched
+/// GraphQL result and falling back to a per-repo REST lookup only when the repo
+/// is absent from the batch (no token, GraphQL error, or a null/deleted node).
+async fn repo_recent(
+    pushed: &HashMap<String, u64>,
+    client: &reqwest::Client,
+    repo: &GitHubRepo,
+    cutoff: u64,
+    token_manager: &TokenManager,
+) -> bool {
+    if let Some(ts) = repo.node_id.as_deref().and_then(|id| pushed.get(id)) {
+        return *ts >= cutoff;
+    }
+    repo_pushed_recently(client, repo, cutoff, token_manager).await
 }
 
 /// Fetch one page of public repositories starting after `cursor`.
@@ -305,10 +502,16 @@ pub(crate) async fn enumerate_public_repos_page(
         return Ok((Vec::new(), cursor));
     }
 
+    let cutoff = recent_push_cutoff();
+    let pushed = batch_pushed_at(client, &page, token_manager).await;
     let mut max_id = cursor;
     let mut repos = Vec::new();
     for repo in &page {
         max_id = max_id.max(repo.id);
+        // Skip repos whose last push is older than the age window.
+        if !repo_recent(&pushed, client, repo, cutoff, token_manager).await {
+            continue;
+        }
         if let Some(url) = repo.best_url() {
             repos.push(url);
         }
@@ -342,15 +545,17 @@ pub(crate) async fn enumerate_public_repos(
     let client = reqwest::Client::new();
     let mut cursor = since;
     let mut collected: Vec<String> = Vec::new();
+    let cutoff = recent_push_cutoff();
 
     app::info(
         "github",
         format!(
-            "enumerating repos since={}{} shard={}/{}",
+            "enumerating repos since={}{} shard={}/{} (max age {}y)",
             since,
             until.map(|u| format!("..{}", u)).unwrap_or_default(),
             shard_index,
-            shard_count
+            shard_count,
+            max_repo_age_years(),
         ),
     );
 
@@ -361,6 +566,7 @@ pub(crate) async fn enumerate_public_repos(
         }
 
         let mut max_id = cursor;
+        let pushed = batch_pushed_at(&client, &page, token_manager).await;
         for repo in &page {
             max_id = max_id.max(repo.id);
             if let Some(upper) = until {
@@ -374,6 +580,10 @@ pub(crate) async fn enumerate_public_repos(
             }
             if repo.id % shard_count != shard_index {
                 continue; // belongs to another shard/worker
+            }
+            // Skip repos whose last push is older than the age window.
+            if !repo_recent(&pushed, &client, repo, cutoff, token_manager).await {
+                continue;
             }
             if let Some(url) = repo.best_url() {
                 collected.push(url);

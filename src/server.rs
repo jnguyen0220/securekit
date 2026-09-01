@@ -378,7 +378,7 @@ pub async fn run_server() -> Result<()> {
     app::info(
         "server",
         format!(
-            "config workers={} claim_batch={} ignore_rules={} validate_secrets={} azure_active_probe={}",
+            "config scan_concurrency={} claim_batch={} ignore_rules={} validate_secrets={} azure_active_probe={}",
             cfg.scan_workers,
             cfg.claim_batch,
             ignore_rule_count,

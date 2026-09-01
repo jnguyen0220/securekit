@@ -186,7 +186,7 @@ pub async fn run_client(server_url: &str, worker_id: Option<String>) -> Result<(
     app::info(
         "client",
         format!(
-            "{} ready at {} (ttl={}s, workers={}, claim_batch={}, ignore_rules={})",
+            "{} ready at {} (ttl={}s, scan_concurrency={}, claim_batch={}, ignore_rules={})",
             worker_id,
             link.base(),
             config.ttl_secs,

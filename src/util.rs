@@ -18,6 +18,39 @@ pub(crate) fn current_unix_time() -> u64 {
         .as_secs()
 }
 
+/// Parse an RFC 3339 / ISO 8601 UTC timestamp (e.g. `2021-09-01T12:34:56Z`, as
+/// returned by GitHub in `pushed_at`) into seconds since the UNIX epoch.
+/// Returns `None` if the string is not in the expected `...Z` UTC form.
+pub(crate) fn parse_rfc3339_to_unix(ts: &str) -> Option<u64> {
+    let ts = ts.trim();
+    let bytes = ts.as_bytes();
+    // Expect at least `YYYY-MM-DDTHH:MM:SS` and a trailing `Z`.
+    if bytes.len() < 20 || !ts.ends_with('Z') {
+        return None;
+    }
+    let year: i64 = ts.get(0..4)?.parse().ok()?;
+    let month: i64 = ts.get(5..7)?.parse().ok()?;
+    let day: i64 = ts.get(8..10)?.parse().ok()?;
+    let hour: i64 = ts.get(11..13)?.parse().ok()?;
+    let minute: i64 = ts.get(14..16)?.parse().ok()?;
+    let second: i64 = ts.get(17..19)?.parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+
+    // Days from civil date (Howard Hinnant's algorithm), then to seconds.
+    let y = year - i64::from(month <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days_since_epoch = era * 146097 + doe - 719468;
+
+    let secs = days_since_epoch * 86400 + hour * 3600 + minute * 60 + second;
+    u64::try_from(secs).ok()
+}
+
 /// SHA-256 fingerprint of a secret. Storing the fingerprint (instead of the
 /// raw value) lets you prove/track a leak and de-duplicate findings without
 /// hoarding live credentials.
